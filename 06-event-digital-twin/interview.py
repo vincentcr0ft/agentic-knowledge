@@ -42,7 +42,6 @@ from schema import (
     QUESTION_GENERATION_PROMPT,
     SCHEMA_COMPLETENESS_RULES,
     Gap,
-    build_extraction_prompt,
     linearise_graph,
     prioritise_gaps,
     run_schema_completeness,
@@ -67,6 +66,7 @@ llm = ChatOllama(model="qwen2.5:7b", temperature=0)
 
 class InterviewState(TypedDict):
     gaps: list[dict]                     # current gap analysis results
+    addressed_gap_ids: list[str]         # gap rule_ids already asked about
     questions: list[dict]                # generated questions
     user_answers: list[str]              # answers from human
     interview_round: int                 # current round number
@@ -75,6 +75,9 @@ class InterviewState(TypedDict):
     graph_snapshot: str                  # linearised triples
     update_summary: str                  # what was added this round
     steps: list[str]                     # audit trail
+    original_statement: str              # full text of the initial statement
+    all_answers: list[str]               # accumulated answers across all rounds
+    transcript: list[dict]               # records of each interaction for output
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -104,6 +107,24 @@ def _parse_json_array(content: str) -> list | None:
                 return result
         except json.JSONDecodeError:
             pass
+    return None
+
+
+def _parse_json_obj(content: str) -> dict | None:
+    """Parse a JSON object from LLM output."""
+    content = content.strip()
+    content = re.sub(r"^```(?:json)?\s*", "", content)
+    content = re.sub(r"\s*```$", "", content)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                return json.loads(content[start:end])
+            except json.JSONDecodeError:
+                pass
     return None
 
 
@@ -169,12 +190,16 @@ def analyse_gaps(state: InterviewState) -> dict:
         else:
             print("    No investigative gaps found (or parse failed)")
 
-    # ── Deduplicate and prioritise ──────────────────────────────────────
+    # ── Deduplicate, filter addressed, and prioritise ─────────────────
+    addressed = set(state.get("addressed_gap_ids", []))
     seen = set()
     unique_gaps = []
     for gap in all_gaps:
         key = gap.get("gap_description", "")
-        if key not in seen:
+        rule_id = gap.get("rule_id", "")
+        # Build a composite key: rule_id + entity for schema gaps
+        composite_key = f"{rule_id}::{gap.get('entity_desc', '')}"
+        if key not in seen and composite_key not in addressed:
             seen.add(key)
             unique_gaps.append(gap)
 
@@ -202,16 +227,203 @@ def analyse_gaps(state: InterviewState) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Node 2 — generate_questions
+# Node 2 — attempt_self_resolution
 # ═══════════════════════════════════════════════════════════════════════════
 
-MAX_QUESTIONS_PER_ROUND = 4
+SELF_RESOLUTION_PROMPT = """\
+You are an analyst reviewing a knowledge graph built from a witness statement.
+The graph has gaps (missing information). Your job is to check whether the
+ORIGINAL TEXT already contains information that fills these gaps — the
+extraction may have missed it, or the information may apply to multiple events.
+
+For example, if the witness says "at about 2:15 PM" once and there are
+multiple events, that time likely applies to all events in the same scene.
+Similarly, a location mentioned once may apply to all nearby events.
+
+ORIGINAL STATEMENT:
+{statement}
+
+PREVIOUS FOLLOW-UP ANSWERS:
+{previous_answers}
+
+CURRENT GRAPH (linearised triples):
+{triples}
+
+GAPS TO CHECK:
+{gaps}
+
+For EACH gap, decide:
+  - "resolvable": the text already contains information to fill this gap
+  - "unresolvable": the text genuinely does not contain this information
+
+For resolvable gaps, extract the entities and relationships needed.
+
+Return valid JSON:
+{{
+  "resolutions": [
+    {{
+      "gap_index": 0,
+      "status": "resolvable",
+      "reasoning": "The witness mentioned 2:15 PM which applies to this event too",
+      "entities": [
+        {{"id": "t_resolved", "label": "Time", "properties": {{"value": "approximately 2:15 PM", "precision": "approximate"}}}}
+      ],
+      "relationships": [
+        {{"from_id": "existing_event_desc", "rel_type": "OCCURRED_AT_TIME", "to_id": "t_resolved"}}
+      ]
+    }},
+    {{
+      "gap_index": 1,
+      "status": "unresolvable",
+      "reasoning": "The text does not mention a registration number"
+    }}
+  ]
+}}
+
+CRITICAL RULES:
+- For relationships to EXISTING nodes, use the node's description as the id
+  (match against the graph triples above)
+- DO NOT create new Event nodes — events are already in the graph
+- DO NOT invent facts not present in the text
+- A Time or Location mentioned once in the text CAN apply to multiple events
+  in the same scene — this is the most common resolution
+- Check the FULL text carefully, including follow-up answers
+"""
+
+
+def attempt_self_resolution(state: InterviewState) -> dict:
+    """Try to fill gaps from existing text before asking the witness.
+
+    Many gaps arise because the extraction stage creates separate events
+    but links contextual information (time, place) to only one of them.
+    The original text often already contains the answer.
+    """
+    gaps = state.get("gaps", [])
+    triples = state.get("graph_snapshot", "")
+    statement = state.get("original_statement", "")
+    prev_answers = state.get("all_answers", [])
+    round_num = state.get("interview_round", 1)
+    addressed = list(state.get("addressed_gap_ids", []))
+    transcript = list(state.get("transcript", []))
+
+    if not gaps:
+        return {
+            "gaps": [],
+            "steps": state.get("steps", []) + [
+                "self_resolution: no gaps to resolve"
+            ],
+        }
+
+    # Format gaps for the prompt (batch up to 10)
+    batch = gaps[:10]
+    gap_lines = []
+    for i, gap in enumerate(batch):
+        gap_lines.append(
+            f"{i}. [{gap.get('priority', '?')}] {gap.get('gap_description', '?')}"
+        )
+    gap_text = "\n".join(gap_lines)
+
+    answers_text = "\n".join(
+        f"A{i+1}: {a}" for i, a in enumerate(prev_answers)
+    ) if prev_answers else "(none yet)"
+
+    prompt = SELF_RESOLUTION_PROMPT.format(
+        statement=statement,
+        previous_answers=answers_text,
+        triples=triples,
+        gaps=gap_text,
+    )
+
+    result = llm.invoke([
+        SystemMessage(content=prompt),
+        HumanMessage(content="Analyse each gap and resolve what you can."),
+    ])
+
+    parsed = _parse_json_obj(result.content)
+    resolved_count = 0
+    resolved_indices = set()
+
+    if parsed and "resolutions" in parsed:
+        for res in parsed["resolutions"]:
+            idx = res.get("gap_index", -1)
+            status = res.get("status", "")
+            reasoning = res.get("reasoning", "")
+
+            if status == "resolvable" and 0 <= idx < len(batch):
+                gap = batch[idx]
+                entities = res.get("entities", [])
+                relationships = res.get("relationships", [])
+
+                if entities or relationships:
+                    extracted = {
+                        "entities": entities,
+                        "relationships": relationships,
+                    }
+                    _merge_new_facts(extracted, round_num)
+                    resolved_count += 1
+                    resolved_indices.add(idx)
+
+                    # Mark as addressed
+                    composite_key = f"{gap.get('rule_id', '')}::{gap.get('entity_desc', '')}"
+                    if composite_key not in addressed:
+                        addressed.append(composite_key)
+
+                    # Record in transcript
+                    transcript.append({
+                        "type": "self_resolution",
+                        "round": round_num,
+                        "gap": gap.get("gap_description", ""),
+                        "reasoning": reasoning,
+                        "entities_added": len(entities),
+                        "relationships_added": len(relationships),
+                    })
+
+                    print(f"    ✓ Self-resolved: {gap.get('gap_description', '?')[:60]}")
+                    print(f"      Reason: {reasoning[:80]}")
+
+    # Remove resolved gaps from the list
+    remaining_gaps = [
+        g for i, g in enumerate(gaps)
+        if i not in resolved_indices
+    ]
+    # Also remove any gaps beyond batch that were already addressed
+    remaining_gaps = [
+        g for g in remaining_gaps
+        if f"{g.get('rule_id', '')}::{g.get('entity_desc', '')}" not in set(addressed)
+    ]
+
+    print(f"  ▸ Self-resolution: {resolved_count} gaps filled from existing text,"
+          f" {len(remaining_gaps)} remain")
+
+    # Refresh the graph snapshot after self-resolution
+    updated_triples = linearise_graph(driver) if resolved_count > 0 else triples
+
+    return {
+        "gaps": remaining_gaps,
+        "addressed_gap_ids": addressed,
+        "graph_snapshot": updated_triples,
+        "is_complete": len(remaining_gaps) == 0,
+        "transcript": transcript,
+        "steps": state.get("steps", []) + [
+            f"self_resolution (round {round_num}): resolved {resolved_count},"
+            f" {len(remaining_gaps)} remain"
+        ],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Node 3 — generate_questions
+# ═══════════════════════════════════════════════════════════════════════════
+
+MAX_QUESTIONS_PER_ROUND = 1
 
 
 def generate_questions(state: InterviewState) -> dict:
-    """Generate targeted follow-up questions from the prioritised gaps.
+    """Generate ONE targeted follow-up question for the highest-priority gap.
 
-    Questions should be specific, non-leading, and reference what IS known.
+    Asks the single most important question per round so the witness
+    can focus. The gap being targeted is tracked so it won't be
+    re-asked regardless of the answer quality.
     """
     gaps = state.get("gaps", [])
     triples = state.get("graph_snapshot", "")
@@ -224,9 +436,12 @@ def generate_questions(state: InterviewState) -> dict:
             ],
         }
 
-    # Format gaps for the prompt
+    # Pick the single highest-priority gap
+    top_gap = gaps[0]
+
+    # Format for the prompt — provide context of the top gap + a few more
     gap_lines = []
-    for i, gap in enumerate(gaps[:10], 1):  # Cap at 10 for prompt size
+    for i, gap in enumerate(gaps[:5], 1):
         gap_lines.append(
             f"{i}. [{gap.get('priority', '?')}] {gap.get('gap_description', '?')}"
         )
@@ -235,37 +450,42 @@ def generate_questions(state: InterviewState) -> dict:
     prompt = QUESTION_GENERATION_PROMPT.format(
         gaps=gap_text,
         triples=triples,
-        max_questions=MAX_QUESTIONS_PER_ROUND,
+        max_questions=1,
     )
 
     result = llm.invoke([
         SystemMessage(content=prompt),
-        HumanMessage(content="Generate the questions now."),
+        HumanMessage(content="Generate exactly ONE question targeting the first gap."),
     ])
 
     questions = _parse_json_array(result.content)
 
     if not questions:
-        # Fallback: generate simple questions from top gaps
-        questions = []
-        for gap in gaps[:MAX_QUESTIONS_PER_ROUND]:
-            questions.append({
-                "question": f"Can you provide more detail about: {gap.get('gap_description', '')}?",
-                "targets_gaps": [gap.get("rule_id", "unknown")],
-            })
+        # Fallback: generate a direct question from the top gap
+        questions = [{
+            "question": f"Can you provide more detail about: {top_gap.get('gap_description', '')}?",
+            "targets_gaps": [top_gap.get("rule_id", "unknown")],
+        }]
         print("  ⚠ LLM question generation failed — using gap-based fallback")
 
-    # Cap at max
-    questions = questions[:MAX_QUESTIONS_PER_ROUND]
+    # Take only the first question
+    question = questions[0]
 
-    print(f"  ▸ Generated {len(questions)} questions:")
-    for i, q in enumerate(questions, 1):
-        print(f"    Q{i}: {q.get('question', '?')}")
+    # Ensure targets_gaps includes the top gap's composite key
+    if "targets_gaps" not in question:
+        question["targets_gaps"] = []
+    composite_key = f"{top_gap.get('rule_id', '')}::{top_gap.get('entity_desc', '')}"
+    question["_gap_composite_key"] = composite_key
+    question["_reason"] = top_gap.get("gap_description", "")
+
+    print(f"  ▸ Question (targeting: {top_gap.get('gap_description', '?')[:60]}):")
+    print(f"    Why:  {top_gap.get('gap_description', '?')}")
+    print(f"    Ask:  {question.get('question', '?')}")
 
     return {
-        "questions": questions,
+        "questions": [question],
         "steps": state.get("steps", []) + [
-            f"generate_questions: {len(questions)} questions"
+            f"generate_questions: 1 question targeting '{top_gap.get('rule_id', '?')}'"
         ],
     }
 
@@ -275,10 +495,10 @@ def generate_questions(state: InterviewState) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def collect_answers(state: InterviewState) -> dict:
-    """Pause execution and present questions to the human.
+    """Pause execution and present ONE question to the human.
 
     Uses LangGraph's interrupt() to suspend the graph. The caller
-    resumes with a Command(resume=<answers>) to continue.
+    resumes with a Command(resume=<answer>) to continue.
     """
     questions = state.get("questions", [])
 
@@ -290,35 +510,31 @@ def collect_answers(state: InterviewState) -> dict:
             ],
         }
 
-    # Format questions for display
-    question_texts = []
-    for i, q in enumerate(questions, 1):
-        question_texts.append(f"Q{i}: {q.get('question', '?')}")
+    question_text = questions[0].get("question", "?")
+    reason = questions[0].get("_reason", "")
 
     # ── INTERRUPT — pause here and wait for human input ─────────────────
-    answers = interrupt({
-        "questions": question_texts,
+    answer = interrupt({
+        "question": question_text,
+        "reason": reason,
         "instruction": (
-            "Please answer the questions above. You can answer "
-            "'I don't know' for any question. Provide your answers "
-            "as a list, one per question."
+            "Please answer the question above. If you don't know, "
+            "say 'I don't know' and we'll move on."
         ),
     })
 
-    # answers comes back from Command(resume=...)
-    if isinstance(answers, str):
-        user_answers = [answers]
-    elif isinstance(answers, list):
-        user_answers = answers
+    # answer comes back from Command(resume=...)
+    if isinstance(answer, list):
+        user_answer = answer[0] if answer else ""
     else:
-        user_answers = [str(answers)]
+        user_answer = str(answer)
 
-    print(f"  ▸ Received {len(user_answers)} answers from witness")
+    print(f"  ▸ Received answer: {user_answer[:80]}")
 
     return {
-        "user_answers": user_answers,
+        "user_answers": [user_answer],
         "steps": state.get("steps", []) + [
-            f"collect_answers: received {len(user_answers)} answers"
+            f"collect_answers: received answer"
         ],
     }
 
@@ -328,29 +544,55 @@ def collect_answers(state: InterviewState) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 ANSWER_EXTRACTION_PROMPT = """\
-You are extracting new facts from a witness's follow-up answers to add to \
-an existing knowledge graph.
+You are updating an existing knowledge graph with new details from a \
+witness's follow-up answer. Your job is to ENRICH existing entities, \
+NOT create new Event nodes.
 
 EXISTING GRAPH (linearised triples):
 {triples}
 
-QUESTIONS ASKED:
+QUESTION ASKED:
 {questions}
 
-WITNESS ANSWERS:
+WITNESS ANSWER:
 {answers}
 
-Extract any NEW entities and relationships from the answers. Use the same \
-schema as the original extraction:
+THE GAP BEING FILLED:
+{gap_description}
 
-{schema}
+Your task: extract facts from the answer that fill the gap described above.
 
-RULES:
-- Only extract facts from the ANSWERS — do not repeat existing graph content
-- If the witness says "I don't know" or similar, extract nothing for that question
-- Link new entities to existing ones where appropriate
-- For entity ids, use a prefix to distinguish from original: a_p1, a_e1, a_v1 etc.
-- Assign source_type: "interview_round_{round_num}"
+CRITICAL RULES:
+- DO NOT create new Event nodes — the events are already in the graph
+- Instead, add PROPERTIES to existing entities or create RELATIONSHIPS \
+between existing entities and new detail entities
+- For example, if the gap is "Vehicle has no registration" and the answer \
+is "I think it was AB12 CDE", update the existing Vehicle node's \
+registration property — do NOT create a new Vehicle
+- You CAN create new nodes for: PhysicalDescription, Time, Location, Object \
+— these are detail nodes that attach to existing entities
+- Reference existing entities by matching their description from the graph
+- If the answer doesn't provide useful information, return empty arrays
+
+HOW TO STRUCTURE UPDATES:
+
+1. To add a property to an existing node, return it as an entity with the \
+SAME description/identifier and the new properties:
+   {{"id": "existing_v1", "label": "Vehicle", "properties": {{"description": \
+"a red car", "registration": "AB12 CDE"}}}}
+
+2. To link a new detail node to an existing entity, create the detail node \
+and a relationship:
+   {{"id": "pd1", "label": "PhysicalDescription", "properties": {{"summary": \
+"tall, dark hair, about 30"}}}}
+   relationship: {{"from_id": "existing_p1", "rel_type": "DESCRIBED_AS", \
+"to_id": "pd1"}}
+
+3. To add a time to an existing event, create a Time node and link it:
+   {{"id": "t1", "label": "Time", "properties": {{"value": "about 2:15 PM", \
+"precision": "approximate"}}}}
+   relationship: {{"from_id": "existing_e1", "rel_type": "OCCURRED_AT_TIME", \
+"to_id": "t1"}}
 
 Return valid JSON:
 {{
@@ -358,91 +600,120 @@ Return valid JSON:
   "relationships": [...]
 }}
 
-If no new facts can be extracted, return: {{"entities": [], "relationships": []}}
+If no useful facts can be extracted, return: {{"entities": [], "relationships": []}}
 """
 
 
-def _parse_json_obj(content: str) -> dict | None:
-    """Parse a JSON object from LLM output."""
-    content = content.strip()
-    content = re.sub(r"^```(?:json)?\s*", "", content)
-    content = re.sub(r"\s*```$", "", content)
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        start = content.find("{")
-        end = content.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                return json.loads(content[start:end])
-            except json.JSONDecodeError:
-                pass
-    return None
-
-
 def extract_from_answers(state: InterviewState) -> dict:
-    """Extract new entities/relationships from the witness's answers."""
+    """Extract new facts from the witness's answer and mark the gap as addressed.
+
+    Even if extraction fails or the answer is unhelpful, the gap is marked
+    as addressed so it won't be re-asked.
+    """
     answers = state.get("user_answers", [])
     questions = state.get("questions", [])
     triples = state.get("graph_snapshot", "")
     round_num = state.get("interview_round", 1)
+    addressed = list(state.get("addressed_gap_ids", []))
+    all_answers = list(state.get("all_answers", []))
+    transcript = list(state.get("transcript", []))
 
-    if not answers or all(
-        a.lower().strip() in ("", "i don't know", "idk", "no", "n/a", "none")
-        for a in answers
+    # Mark the targeted gap as addressed regardless of answer quality
+    gap_desc = ""
+    gaps = state.get("gaps", [])
+    if gaps:
+        gap_desc = gaps[0].get("gap_description", "")
+
+    if questions:
+        composite_key = questions[0].get("_gap_composite_key", "")
+        if composite_key and composite_key not in addressed:
+            addressed.append(composite_key)
+
+    answer_text = answers[0] if answers else ""
+    question_text = questions[0].get("question", "?") if questions else "?"
+
+    # Accumulate this answer for future self-resolution rounds
+    if answer_text:
+        all_answers.append(answer_text)
+
+    if not answer_text or answer_text.lower().strip() in (
+        "", "i don't know", "idk", "no", "n/a", "none", "not sure",
+        "can't remember", "don't remember",
     ):
-        print("  ▸ No actionable answers — skipping extraction")
+        print(f"  ▸ No actionable answer — gap marked as addressed, moving on")
+        transcript.append({
+            "type": "question_answer",
+            "round": round_num,
+            "question": question_text,
+            "reason": gap_desc,
+            "answer": answer_text or "(no answer)",
+            "outcome": "No new facts extracted",
+        })
         return {
-            "update_summary": "No new facts extracted",
+            "update_summary": "No new facts extracted (gap marked addressed)",
+            "addressed_gap_ids": addressed,
+            "all_answers": all_answers,
+            "transcript": transcript,
             "steps": state.get("steps", []) + [
-                "extract_from_answers: no actionable answers"
+                "extract_from_answers: no actionable answer, gap addressed"
             ],
         }
-
-    # Format Q&A pairs
-    qa_lines = []
-    for i, q in enumerate(questions):
-        answer = answers[i] if i < len(answers) else "(no answer)"
-        qa_lines.append(f"Q: {q.get('question', '?')}\nA: {answer}")
-    qa_text = "\n\n".join(qa_lines)
-
-    question_text = "\n".join(
-        f"Q{i}: {q.get('question', '?')}" for i, q in enumerate(questions, 1)
-    )
 
     prompt = ANSWER_EXTRACTION_PROMPT.format(
         triples=triples,
         questions=question_text,
-        answers=qa_text,
-        schema=build_extraction_prompt(),
-        round_num=round_num,
+        answers=f"Q: {question_text}\nA: {answer_text}",
+        gap_description=gap_desc,
     )
 
     result = llm.invoke([
         SystemMessage(content=prompt),
-        HumanMessage(content="Extract new facts now."),
+        HumanMessage(content="Extract facts to fill the gap now."),
     ])
 
     extracted = _parse_json_obj(result.content)
 
     if extracted is None:
-        print("  ⚠ Answer extraction returned invalid JSON")
+        print("  ⚠ Answer extraction returned invalid JSON — gap marked addressed")
+        transcript.append({
+            "type": "question_answer",
+            "round": round_num,
+            "question": question_text,
+            "reason": gap_desc,
+            "answer": answer_text,
+            "outcome": "Extraction failed (parse error)",
+        })
         return {
-            "update_summary": "Extraction failed",
+            "update_summary": "Extraction failed (gap marked addressed)",
+            "addressed_gap_ids": addressed,
+            "all_answers": all_answers,
+            "transcript": transcript,
             "steps": state.get("steps", []) + [
-                "extract_from_answers: JSON parse failed"
+                "extract_from_answers: JSON parse failed, gap addressed"
             ],
         }
 
     n_ents = len(extracted.get("entities", []))
     n_rels = len(extracted.get("relationships", []))
-    print(f"  ▸ Extracted from answers: {n_ents} entities, {n_rels} relationships")
+    print(f"  ▸ Extracted from answer: {n_ents} entities, {n_rels} relationships")
 
     # ── Load new facts into Neo4j ───────────────────────────────────────
     summary = _merge_new_facts(extracted, round_num)
 
+    transcript.append({
+        "type": "question_answer",
+        "round": round_num,
+        "question": question_text,
+        "reason": gap_desc,
+        "answer": answer_text,
+        "outcome": summary,
+    })
+
     return {
         "update_summary": summary,
+        "addressed_gap_ids": addressed,
+        "all_answers": all_answers,
+        "transcript": transcript,
         "steps": state.get("steps", []) + [
             f"extract_from_answers: {summary}"
         ],
@@ -590,10 +861,16 @@ def should_continue(state: InterviewState) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def build_interview_graph() -> StateGraph:
-    """Build the interview loop as a LangGraph with human-in-the-loop."""
+    """Build the interview loop as a LangGraph with human-in-the-loop.
+
+    Pipeline:
+      analyse_gaps → attempt_self_resolution → [if gaps remain]
+        generate_questions → collect_answers → extract_from_answers → [loop]
+    """
     builder = StateGraph(InterviewState)
 
     builder.add_node("analyse_gaps", analyse_gaps)
+    builder.add_node("attempt_self_resolution", attempt_self_resolution)
     builder.add_node("generate_questions", generate_questions)
     builder.add_node("collect_answers", collect_answers)
     builder.add_node("extract_from_answers", extract_from_answers)
@@ -601,9 +878,16 @@ def build_interview_graph() -> StateGraph:
     # Entry → gap analysis
     builder.add_edge(START, "analyse_gaps")
 
-    # Gap analysis → conditional: if gaps, generate questions; else done
+    # Gap analysis → conditional: if gaps, try self-resolution; else done
     builder.add_conditional_edges(
         "analyse_gaps",
+        lambda s: "done" if s.get("is_complete") else "has_gaps",
+        {"has_gaps": "attempt_self_resolution", "done": END},
+    )
+
+    # Self-resolution → conditional: if gaps remain, ask human; else done
+    builder.add_conditional_edges(
+        "attempt_self_resolution",
         lambda s: "done" if s.get("is_complete") else "has_gaps",
         {"has_gaps": "generate_questions", "done": END},
     )
@@ -629,17 +913,26 @@ def build_interview_graph() -> StateGraph:
 # CLI — interactive interview loop
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_interview(max_rounds: int = 5, thread_id: str = "interview-1"):
+def run_interview(
+    max_rounds: int = 5,
+    thread_id: str = "interview-1",
+    statement: str = "",
+    transcript_path: str | None = None,
+):
     """Run the full interview loop interactively.
 
-    The graph will pause at each collect_answers node, present questions
-    to the user, and resume when answers are provided.
+    Args:
+        max_rounds: Maximum interview rounds before stopping.
+        thread_id: LangGraph thread identifier.
+        statement: The original witness statement text (for self-resolution).
+        transcript_path: If set, write a plain-text transcript on completion.
     """
     graph = build_interview_graph()
     config = {"configurable": {"thread_id": thread_id}}
 
     initial_state: InterviewState = {
         "gaps": [],
+        "addressed_gap_ids": [],
         "questions": [],
         "user_answers": [],
         "interview_round": 0,
@@ -648,12 +941,16 @@ def run_interview(max_rounds: int = 5, thread_id: str = "interview-1"):
         "graph_snapshot": "",
         "update_summary": "",
         "steps": [],
+        "original_statement": statement,
+        "all_answers": [],
+        "transcript": [],
     }
 
     print(f"{'═' * 70}")
     print(f"  EVENT DIGITAL TWIN — INTERVIEW PHASE")
     print(f"{'═' * 70}")
-    print(f"  Analysing graph for gaps and generating questions …")
+    print(f"  The system will first try to fill gaps from the existing text,")
+    print(f"  then ask follow-up questions for anything it can't resolve.")
     print(f"  (type 'quit' or 'done' to end early)\n")
 
     # ── First invocation — runs until the interrupt ─────────────────────
@@ -672,56 +969,117 @@ def run_interview(max_rounds: int = 5, thread_id: str = "interview-1"):
             print("  Interview complete.")
             break
 
-        # We're at an interrupt — present questions and collect answers
-        # The interrupt value contains the questions
+        # We're at an interrupt — present the question and collect one answer
         if snapshot.tasks:
             for task in snapshot.tasks:
                 if hasattr(task, "interrupts") and task.interrupts:
                     interrupt_data = task.interrupts[0].value
-                    questions = interrupt_data.get("questions", [])
+                    question = interrupt_data.get("question", "")
+                    reason = interrupt_data.get("reason", "")
 
                     print(f"\n{'─' * 70}")
-                    print("  Follow-up questions for the witness:\n")
-                    for q in questions:
-                        print(f"    {q}")
-                    print()
-                    print(f"  {interrupt_data.get('instruction', '')}")
+                    if reason:
+                        print(f"  [Reason: {reason}]")
+                    print(f"  {question}")
+                    print(f"\n  {interrupt_data.get('instruction', '')}")
                     print(f"{'─' * 70}\n")
 
-        # Collect answers from the user
-        answers = []
-        questions = result.get("questions", []) if result else []
-        n_questions = len(questions)
+        # Collect one answer from the user
+        try:
+            answer = input("  Your answer: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = "done"
 
-        for i in range(max(n_questions, 1)):
-            try:
-                answer = input(f"  Answer {i + 1}: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                answer = "done"
+        if answer.lower() in ("quit", "done", "exit"):
+            print("\n  Ending interview early.")
+            _print_final_summary(graph, config, transcript_path)
+            return
 
-            if answer.lower() in ("quit", "done", "exit"):
-                print("\n  Ending interview early.")
-                # Print final state
-                _print_final_summary(graph, config)
-                return
-
-            answers.append(answer)
-
-            # If user answered fewer than expected, that's fine
-            if i >= n_questions - 1:
-                break
-
-        # Resume the graph with the answers
+        # Resume the graph with the answer
         result = None
         for event in graph.stream(
-            Command(resume=answers), config, stream_mode="values"
+            Command(resume=answer), config, stream_mode="values"
         ):
             result = event
 
-    _print_final_summary(graph, config)
+    _print_final_summary(graph, config, transcript_path)
 
 
-def _print_final_summary(graph, config):
+def _write_transcript(state_values: dict, transcript_path: str):
+    """Write a plain-text transcript of the full interview session."""
+    from pathlib import Path
+
+    lines = []
+    lines.append("=" * 70)
+    lines.append("  EVENT DIGITAL TWIN — INTERVIEW TRANSCRIPT")
+    lines.append(f"  Generated: {datetime.now(timezone.utc).isoformat()}")
+    lines.append("=" * 70)
+
+    # Original statement
+    statement = state_values.get("original_statement", "")
+    if statement:
+        lines.append("")
+        lines.append("─" * 70)
+        lines.append("  ORIGINAL STATEMENT")
+        lines.append("─" * 70)
+        lines.append(f"  {statement}")
+
+    # Transcript entries
+    transcript = state_values.get("transcript", [])
+    if transcript:
+        lines.append("")
+        lines.append("─" * 70)
+        lines.append("  INTERVIEW RECORD")
+        lines.append("─" * 70)
+
+        for i, entry in enumerate(transcript, 1):
+            lines.append("")
+            entry_type = entry.get("type", "unknown")
+            round_num = entry.get("round", "?")
+
+            if entry_type == "self_resolution":
+                lines.append(f"  [{i}] SELF-RESOLVED (Round {round_num})")
+                lines.append(f"      Gap:       {entry.get('gap', '?')}")
+                lines.append(f"      Reasoning: {entry.get('reasoning', '?')}")
+                lines.append(f"      Added:     {entry.get('entities_added', 0)} entities,"
+                             f" {entry.get('relationships_added', 0)} relationships")
+            elif entry_type == "question_answer":
+                lines.append(f"  [{i}] QUESTION (Round {round_num})")
+                lines.append(f"      Asked:     {entry.get('question', '?')}")
+                lines.append(f"      Reason:    {entry.get('reason', '?')}")
+                lines.append(f"      Answer:    {entry.get('answer', '?')}")
+                lines.append(f"      Outcome:   {entry.get('outcome', '?')}")
+
+    # Final graph
+    triples = linearise_graph(driver)
+    lines.append("")
+    lines.append("─" * 70)
+    lines.append("  FINAL GRAPH STATE")
+    lines.append("─" * 70)
+    for line in triples.split("\n"):
+        lines.append(f"  {line}")
+
+    # Audit trail
+    lines.append("")
+    lines.append("─" * 70)
+    lines.append("  AUDIT TRAIL")
+    lines.append("─" * 70)
+    for step in state_values.get("steps", []):
+        lines.append(f"    • {step}")
+
+    rounds = state_values.get("interview_round", 0)
+    gaps_remaining = len(state_values.get("gaps", []))
+    lines.append("")
+    lines.append(f"  Rounds completed: {rounds}")
+    lines.append(f"  Gaps remaining:  {gaps_remaining}")
+    lines.append("=" * 70)
+
+    text = "\n".join(lines) + "\n"
+    Path(transcript_path).write_text(text)
+    print(f"\n  Transcript written to: {transcript_path}")
+
+
+def _print_final_summary(graph, config, transcript_path: str | None = None):
     """Print the final graph state and audit trail."""
     final_state = graph.get_state(config)
     state_values = final_state.values
@@ -745,6 +1103,9 @@ def _print_final_summary(graph, config):
     print(f"\n  Rounds completed: {rounds}")
     print(f"  Gaps remaining:  {gaps_remaining}")
     print(f"{'═' * 70}")
+
+    if transcript_path:
+        _write_transcript(state_values, transcript_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

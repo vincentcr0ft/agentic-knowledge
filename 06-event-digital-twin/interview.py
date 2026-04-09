@@ -39,10 +39,12 @@ from neo4j import GraphDatabase
 from schema import (
     INVESTIGATIVE_COMPLETENESS_PROMPT,
     NARRATIVE_COHERENCE_PROMPT,
+    ONTOLOGY_META,
     QUESTION_GENERATION_PROMPT,
     SCHEMA_COMPLETENESS_RULES,
     Gap,
     linearise_graph,
+    materialise_provenance,
     prioritise_gaps,
     run_schema_completeness,
     NODE_TYPES,
@@ -777,6 +779,7 @@ def _merge_new_facts(extracted: dict, round_num: int) -> str:
             props["source_type"] = f"interview_round_{round_num}"
             props["extracted_at"] = timestamp
             props["confidence"] = "medium"
+            props["ontology_id"] = ONTOLOGY_META["id"]
 
             safe_props = {
                 k: v for k, v in props.items()
@@ -828,6 +831,17 @@ def _merge_new_facts(extracted: dict, round_num: int) -> str:
 
     msg = f"Merged {created_nodes} nodes, {created_rels} relationships (round {round_num})"
     print(f"  ✓ {msg}")
+
+    # Materialise SOSA/PROV layer for this interview round
+    if created_nodes > 0 or created_rels > 0:
+        source_type = f"interview_round_{round_num}"
+        materialise_provenance(
+            driver,
+            source_type=source_type,
+            observation_desc=f"Follow-up interview round {round_num}",
+            observation_type="follow_up",
+        )
+
     return msg
 
 
@@ -1006,73 +1020,58 @@ def run_interview(
 
 
 def _write_transcript(state_values: dict, transcript_path: str):
-    """Write a plain-text transcript of the full interview session."""
+    """Write a plain-text transcript: statement, Q1, A1, Q2, A2, …"""
     from pathlib import Path
 
     lines = []
-    lines.append("=" * 70)
-    lines.append("  EVENT DIGITAL TWIN — INTERVIEW TRANSCRIPT")
-    lines.append(f"  Generated: {datetime.now(timezone.utc).isoformat()}")
-    lines.append("=" * 70)
+    lines.append("INTERVIEW TRANSCRIPT")
+    lines.append(f"Generated: {datetime.now(timezone.utc).isoformat()}")
+    lines.append("")
 
-    # Original statement
+    # ── Original statement ──────────────────────────────────────────────
     statement = state_values.get("original_statement", "")
     if statement:
+        lines.append("WITNESS STATEMENT")
+        lines.append("-" * 40)
+        lines.append(statement)
         lines.append("")
-        lines.append("─" * 70)
-        lines.append("  ORIGINAL STATEMENT")
-        lines.append("─" * 70)
-        lines.append(f"  {statement}")
 
-    # Transcript entries
+    # ── Chronological Q&A record ────────────────────────────────────────
     transcript = state_values.get("transcript", [])
     if transcript:
-        lines.append("")
-        lines.append("─" * 70)
-        lines.append("  INTERVIEW RECORD")
-        lines.append("─" * 70)
+        lines.append("INTERVIEW")
+        lines.append("-" * 40)
 
-        for i, entry in enumerate(transcript, 1):
-            lines.append("")
+        for entry in transcript:
             entry_type = entry.get("type", "unknown")
-            round_num = entry.get("round", "?")
 
             if entry_type == "self_resolution":
-                lines.append(f"  [{i}] SELF-RESOLVED (Round {round_num})")
-                lines.append(f"      Gap:       {entry.get('gap', '?')}")
-                lines.append(f"      Reasoning: {entry.get('reasoning', '?')}")
-                lines.append(f"      Added:     {entry.get('entities_added', 0)} entities,"
+                lines.append("")
+                lines.append(f"[SYSTEM resolved from existing text]")
+                lines.append(f"Gap: {entry.get('gap', '?')}")
+                lines.append(f"Reasoning: {entry.get('reasoning', '?')}")
+                lines.append(f"Result: added {entry.get('entities_added', 0)} entities,"
                              f" {entry.get('relationships_added', 0)} relationships")
+
             elif entry_type == "question_answer":
-                lines.append(f"  [{i}] QUESTION (Round {round_num})")
-                lines.append(f"      Asked:     {entry.get('question', '?')}")
-                lines.append(f"      Reason:    {entry.get('reason', '?')}")
-                lines.append(f"      Answer:    {entry.get('answer', '?')}")
-                lines.append(f"      Outcome:   {entry.get('outcome', '?')}")
+                lines.append("")
+                lines.append(f"Q: {entry.get('question', '?')}")
+                lines.append(f"A: {entry.get('answer', '?')}")
 
-    # Final graph
-    triples = linearise_graph(driver)
-    lines.append("")
-    lines.append("─" * 70)
-    lines.append("  FINAL GRAPH STATE")
-    lines.append("─" * 70)
-    for line in triples.split("\n"):
-        lines.append(f"  {line}")
+        lines.append("")
 
-    # Audit trail
-    lines.append("")
-    lines.append("─" * 70)
-    lines.append("  AUDIT TRAIL")
-    lines.append("─" * 70)
-    for step in state_values.get("steps", []):
-        lines.append(f"    • {step}")
-
+    # ── State summary ───────────────────────────────────────────────────
     rounds = state_values.get("interview_round", 0)
     gaps_remaining = len(state_values.get("gaps", []))
+    lines.append("SUMMARY")
+    lines.append("-" * 40)
+    lines.append(f"Rounds completed: {rounds}")
+    lines.append(f"Gaps remaining: {gaps_remaining}")
+
+    # Final graph snapshot
+    triples = linearise_graph(driver)
+    lines.append(f"Graph triples: {triples.count(chr(10)) + 1 if triples != '(empty graph)' else 0}")
     lines.append("")
-    lines.append(f"  Rounds completed: {rounds}")
-    lines.append(f"  Gaps remaining:  {gaps_remaining}")
-    lines.append("=" * 70)
 
     text = "\n".join(lines) + "\n"
     Path(transcript_path).write_text(text)

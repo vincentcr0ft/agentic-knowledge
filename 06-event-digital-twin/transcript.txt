@@ -1,0 +1,69 @@
+INTERVIEW TRANSCRIPT
+Generated: 2026-04-09T15:19:01.341536+00:00
+
+WITNESS STATEMENT
+----------------------------------------
+I was walking along King Street at approximately 2:15 PM on Tuesday when I heard a loud crash. I turned and saw a red car had collided with a cyclist at the junction of King Street and Queen's Road. The driver got out — a tall man wearing a dark jacket. He looked at the cyclist who was on the ground and then got back in his car and drove off heading north on Queen's Road. Another woman who was nearby called an ambulance. I stayed with the cyclist until the paramedics arrived about ten minutes later.
+
+INTERVIEW
+----------------------------------------
+
+[SYSTEM resolved from existing text]
+Gap: Event 'a loud crash' has no timestamp
+Reasoning: The witness mentioned 2:15 PM which applies to this event too
+Result: added 1 entities, 1 relationships
+
+[SYSTEM resolved from existing text]
+Gap: Event 'a red car collided with a cyclist' has no timestamp
+Reasoning: The witness mentioned 2:15 PM which applies to this event too
+Result: added 1 entities, 1 relationships
+
+[SYSTEM resolved from existing text]
+Gap: Event 'the driver got out of the car and looked at the cyclist' has no timestamp
+Reasoning: The witness mentioned 2:15 PM which applies to this event too
+Result: added 1 entities, 1 relationships
+
+[SYSTEM resolved from existing text]
+Gap: Event 'the driver drove off heading north on Queen's Road' has no timestamp
+Reasoning: The witness mentioned 2:15 PM which applies to this event too
+Result: added 1 entities, 1 relationships
+
+[SYSTEM resolved from existing text]
+Gap: Event 'an ambulance was called by another woman' has no timestamp
+Reasoning: The witness mentioned 2:15 PM which applies to this event too
+Result: added 1 entities, 1 relationships
+
+[SYSTEM resolved from existing text]
+Gap: Event 'the witness stayed with the cyclist until paramedics arrived' has no timestamp
+Reasoning: The witness mentioned 2:15 PM which applies to this event too
+Result: added 1 entities, 1 relationships
+
+[SYSTEM resolved from existing text]
+Gap: Event 'a loud crash' has no location
+Reasoning: The witness mentioned King Street and Queen's Road, which is the location of the collision
+Result: added 1 entities, 1 relationships
+
+[SYSTEM resolved from existing text]
+Gap: Event 'a red car collided with a cyclist' has no location
+Reasoning: The witness mentioned King Street and Queen's Road, which is the location of the collision
+Result: added 1 entities, 1 relationships
+
+[SYSTEM resolved from existing text]
+Gap: Event 'the driver got out of the car and looked at the cyclist' has no location
+Reasoning: The witness mentioned King Street and Queen's Road, which is the location of the collision
+Result: added 1 entities, 1 relationships
+
+[SYSTEM resolved from existing text]
+Gap: Event 'the driver drove off heading north on Queen's Road' has no location
+Reasoning: The witness mentioned King Street and Queen's Road, which is the location of the collision
+Result: added 1 entities, 1 relationships
+
+Q: Do you remember where the ambulance was called from when another woman made that call?
+A: by the crash
+
+SUMMARY
+----------------------------------------
+Rounds completed: 1
+Gaps remaining: 19
+Graph triples: 29
+

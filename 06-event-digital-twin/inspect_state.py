@@ -2,20 +2,24 @@
 Module 06 — Agent Run Record
 ═════════════════════════════
 Runs the ingest and query pipelines and prints a human-readable
-record of every step: what the agent was given, what it did, and why.
+record of every step: what the agent was given, what it did, why,
+and exactly how the state changed.
 
 The interview phase is interactive and is best demonstrated via
   python demo.py <statement_file>
 """
+
+import json
 
 from schema import (
     linearise_graph,
     run_schema_completeness,
     prioritise_gaps,
     NODE_TYPES,
+    ONTOLOGY_META,
 )
-from ingest import build_ingest_graph, ingest_statement, driver
-from query import build_query_graph
+from ingest import build_ingest_graph, IngestState, driver
+from query import build_query_graph, QueryState
 
 
 # ─── Sample statement ────────────────────────────────────────────────────
@@ -31,219 +35,277 @@ STATEMENT = (
 )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _fmt_val(val, max_len: int = 120) -> str:
+    """Format a value for display, truncating if needed."""
+    if val is None or val == "" or val == []:
+        return "(empty)"
+    if isinstance(val, list):
+        if not val:
+            return "(empty list)"
+        if len(val) <= 3:
+            return json.dumps(val, ensure_ascii=False)
+        return f"[{len(val)} items] first: {json.dumps(val[0], ensure_ascii=False)}"
+    if isinstance(val, dict):
+        if not val:
+            return "(empty dict)"
+        keys = list(val.keys())
+        key_str = ", ".join(keys[:5])
+        suffix = "…" if len(keys) > 5 else ""
+        return "{" + key_str + suffix + "}"
+    s = str(val)
+    if len(s) > max_len:
+        return s[:max_len] + "…"
+    return s
+
+
+def _print_state_diff(prev: dict, curr: dict, indent: str = "    "):
+    """Print changed fields between two state snapshots."""
+    all_keys = sorted(set(list(prev.keys()) + list(curr.keys())))
+    changed = False
+    for key in all_keys:
+        old = prev.get(key)
+        new = curr.get(key)
+        if old != new:
+            changed = True
+            print(f"{indent}  {key}:")
+            print(f"{indent}    before: {_fmt_val(old)}")
+            print(f"{indent}    after:  {_fmt_val(new)}")
+    if not changed:
+        print(f"{indent}  (no state changes)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Ingest pipeline narration
+# ═══════════════════════════════════════════════════════════════════════════
+
 def _narrate_ingest():
-    """Run ingest and narrate each step."""
+    """Run ingest and narrate each step with full state diffs."""
+    from langgraph.checkpoint.memory import MemorySaver
+
     print(f"\n{'═' * 70}")
     print(f"  AGENT RUN RECORD — INGEST PIPELINE")
-    print(f"  Statement → Extraction → Coreference Resolution → Graph Load")
+    print(f"  Ontology: {ONTOLOGY_META['name']} v{ONTOLOGY_META['version']}")
     print(f"{'═' * 70}")
 
-    print(f"\n  ── Input ──────────────────────────────────────────────────────")
-    print(f"  The pipeline received a {len(STATEMENT)}-character witness statement.")
-    print(f"  It will parse it into sentences, extract entities/relationships")
-    print(f"  using the ontology schema, resolve coreferences, and load the")
-    print(f"  result into Neo4j.")
+    # Build the graph with checkpointing so we can inspect state history
+    from langgraph.graph import END, START, StateGraph
+    from ingest import parse_statement, extract_entities, resolve_entities, load_to_graph
 
-    result = ingest_statement(STATEMENT)
+    builder = StateGraph(IngestState)
+    builder.add_node("parse_statement", parse_statement)
+    builder.add_node("extract_entities", extract_entities)
+    builder.add_node("resolve_entities", resolve_entities)
+    builder.add_node("load_to_graph", load_to_graph)
+    builder.add_edge(START, "parse_statement")
+    builder.add_edge("parse_statement", "extract_entities")
+    builder.add_edge("extract_entities", "resolve_entities")
+    builder.add_edge("resolve_entities", "load_to_graph")
+    builder.add_edge("load_to_graph", END)
+    graph = builder.compile(checkpointer=MemorySaver())
 
-    # Walk through what happened
-    steps = result.get("steps", [])
-    extracted = result.get("extracted", {})
-    resolved = result.get("resolved", {})
+    config = {"configurable": {"thread_id": "inspect-ingest"}}
 
-    step_num = 0
-    for step in steps:
-        step_num += 1
-        if "parse_statement" in step:
-            seg_count = len(result.get("segments", []))
-            print(f"\n  ── Step {step_num}: Parse Statement ─────────────────────────────────")
-            print(f"  Given:   The raw statement text ({len(STATEMENT)} chars).")
-            print(f"  Action:  Split the text on sentence boundaries (period/question/")
-            print(f"           exclamation followed by whitespace).")
-            print(f"  Result:  {seg_count} segments created. Each segment becomes a")
-            print(f"           provenance reference — we can trace any extracted fact")
-            print(f"           back to the sentence it came from.")
-            print(f"  Why:     Sentence-level provenance is essential for auditability.")
+    initial_state: IngestState = {
+        "raw_statement": STATEMENT,
+        "segments": [],
+        "extracted": {},
+        "resolved": {},
+        "load_summary": "",
+        "steps": [],
+    }
 
-        elif "extract_entities" in step:
-            n_ents = len(extracted.get("entities", []))
-            n_rels = len(extracted.get("relationships", []))
-            print(f"\n  ── Step {step_num}: Extract Entities ────────────────────────────────")
-            print(f"  Given:   All {len(result.get('segments', []))} segments joined as full text.")
-            print(f"  Action:  Sent the text to the LLM with a schema-guided prompt")
-            print(f"           listing all {len(NODE_TYPES)} node types and their required")
-            print(f"           properties (Event, Person, Vehicle, Location, Time, etc).")
-            print(f"           The prompt also lists valid relationship types and rules")
-            print(f"           like 'resolve pronouns' and 'break compound events'.")
-            print(f"  Result:  {n_ents} entities, {n_rels} relationships extracted.")
-            for ent in extracted.get("entities", [])[:5]:
-                label = ent.get("label", "?")
-                props = ent.get("properties", {})
-                desc = (props.get("description") or props.get("name_or_description")
-                        or props.get("value") or props.get("summary") or "?")
-                print(f"           {label:20s}: {desc}")
-            if n_ents > 5:
-                print(f"           … and {n_ents - 5} more")
-            print(f"  Why:     Schema-guided extraction uses the ontology as a contract —")
-            print(f"           the LLM can only produce entity/relationship types that")
-            print(f"           exist in our schema. This prevents hallucinated structures.")
+    # ── Print initial state ─────────────────────────────────────────────
+    print(f"\n  ── Initial State ──────────────────────────────────────────────")
+    print(f"    raw_statement: \"{STATEMENT[:80]}…\"")
+    print(f"    segments:      (empty)")
+    print(f"    extracted:     (empty)")
+    print(f"    resolved:      (empty)")
+    print(f"    load_summary:  (empty)")
+    print(f"    steps:         (empty)")
 
-        elif "resolve_entities" in step:
-            orig_count = len(extracted.get("entities", []))
-            resolved_count = len(resolved.get("entities", []))
-            print(f"\n  ── Step {step_num}: Coreference Resolution ─────────────────────────")
-            print(f"  Given:   {orig_count} extracted entities and the original text.")
-            print(f"  Action:  Asked the LLM to identify co-referent entities (e.g.")
-            print(f'           "the driver" and "a tall man" = same Person). The prompt')
-            print(f"           forbids merging across labels or merging different events.")
-            print(f"  Result:  {orig_count} → {resolved_count} entities", end="")
-            if orig_count != resolved_count:
-                print(f" ({orig_count - resolved_count} merged)")
-            else:
-                print(f" (no merges needed)")
-            if orig_count > 0 and resolved_count < orig_count * 0.4:
-                print(f"  Safety:  Over-merge safeguard triggered — kept originals.")
-            print(f"  Why:     Without resolution, 'the driver' and 'he' would appear")
-            print(f"           as separate people in the graph, creating false gaps.")
+    # ── Run and collect history ─────────────────────────────────────────
+    result = graph.invoke(initial_state, config)
+    history = list(reversed(list(graph.get_state_history(config))))
 
-        elif "load_to_graph" in step:
-            print(f"\n  ── Step {step_num}: Load to Neo4j ──────────────────────────────────")
-            load_summary = result.get("load_summary", "")
-            resolved_ents = len(resolved.get("entities", []))
-            resolved_rels = len(resolved.get("relationships", []))
-            print(f"  Given:   {resolved_ents} resolved entities, {resolved_rels} relationships.")
-            print(f"  Action:  Used parameterised MERGE queries (no string interpolation)")
-            print(f"           to load each entity and relationship into Neo4j. Every node")
-            print(f"           gets provenance properties: source text, source_type,")
-            print(f"           extracted_at timestamp, and confidence level.")
-            print(f"  Result:  {load_summary}")
-            print(f"  Why:     MERGE ensures idempotency — running ingest twice won't")
-            print(f"           duplicate nodes. Provenance lets us trace any graph fact")
-            print(f"           back to the text and extraction that created it.")
+    # Walk consecutive pairs to show state diffs
+    step_names = ["parse_statement", "extract_entities", "resolve_entities", "load_to_graph"]
+    step_descs = {
+        "parse_statement": (
+            "Split the raw statement into sentences for provenance tracking.",
+            "Each sentence becomes a source reference so any extracted fact"
+            " can be traced back to the sentence it came from."
+        ),
+        "extract_entities": (
+            "Send the full text to the LLM with a schema-guided prompt listing"
+            f" all {len(NODE_TYPES)} node types and their required/optional properties.",
+            "Schema-guided extraction constrains the LLM to produce only entity"
+            " and relationship types defined in the ontology."
+        ),
+        "resolve_entities": (
+            "Ask the LLM to identify co-referent entities (e.g. 'the driver'"
+            " and 'he' referring to the same Person) and merge them.",
+            "Without resolution, pronouns and descriptions create duplicate"
+            " nodes, producing false gaps in the completeness analysis."
+        ),
+        "load_to_graph": (
+            "Load resolved entities and relationships into Neo4j using"
+            " parameterised MERGE queries. Every node gets provenance"
+            f" properties and ontology_id='{ONTOLOGY_META['id']}'."
+            " Then materialise the SOSA/PROV layer (Observation node,"
+            " MADE_BY, OBSERVED, DERIVED_FROM relationships).",
+            "MERGE ensures idempotency. Provenance lets us trace any graph"
+            " fact back to the text and extraction round that created it."
+            " SOSA/PROV materialisation completes the observation model."
+        ),
+    }
 
-    # Graph state
+    step_idx = 0
+    prev_vals = dict(initial_state)
+    for cp in history:
+        vals = cp.values
+        current_steps = vals.get("steps", [])
+
+        # Skip if no new steps were added
+        if len(current_steps) <= len(prev_vals.get("steps", [])):
+            continue
+
+        if step_idx < len(step_names):
+            name = step_names[step_idx]
+            action_desc, why = step_descs[name]
+
+            print(f"\n  ── Step {step_idx + 1}: {name} ─────────────────────────────────")
+            print(f"  Action:  {action_desc}")
+            print(f"  Why:     {why}")
+            print(f"\n  State changes:")
+            _print_state_diff(prev_vals, vals)
+
+            step_idx += 1
+
+        prev_vals = dict(vals)
+
+    # ── Final state ─────────────────────────────────────────────────────
     triples = linearise_graph(driver)
     triple_count = triples.count("\n") + 1 if triples != "(empty graph)" else 0
-    print(f"\n  ── Result: Graph State ───────────────────────────────────────")
-    print(f"  {triple_count} triples in the graph:")
+    print(f"\n  ── Final Graph: {triple_count} triples ────────────────────────────")
     for line in triples.split("\n"):
         print(f"    {line}")
 
-    # Gap analysis
     gaps = run_schema_completeness(driver)
     gaps = prioritise_gaps(gaps)
-    print(f"\n  ── Gap Analysis ──────────────────────────────────────────────")
-    print(f"  {len(gaps)} schema gaps remaining:")
+    print(f"\n  ── Schema Gaps: {len(gaps)} ───────────────────────────────────────")
     for g in gaps[:8]:
         print(f"    [{g.priority:8s}] {g.gap_description}")
     if len(gaps) > 8:
         print(f"    … and {len(gaps) - 8} more")
-
-    print(f"\n  ── Audit Trail ───────────────────────────────────────────────")
-    for i, s in enumerate(steps, 1):
-        print(f"    {i}. {s}")
     print()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Query pipeline narration
+# ═══════════════════════════════════════════════════════════════════════════
+
 def _narrate_query():
-    """Run a query and narrate each step."""
+    """Run a query and narrate each step with full state diffs."""
     question = "What happened at the junction of King Street and Queen's Road?"
 
     print(f"\n{'═' * 70}")
     print(f"  AGENT RUN RECORD — QUERY PIPELINE")
-    print(f"  Question → Entity Detection → Graph Retrieval → Grounded Answer")
     print(f"{'═' * 70}")
 
-    print(f"\n  ── Input ──────────────────────────────────────────────────────")
-    print(f"  Question: \"{question}\"")
+    graph = build_query_graph()
+    config = {"configurable": {"thread_id": "inspect-q1"}}
 
-    query_graph = build_query_graph()
-    q_config = {"configurable": {"thread_id": "inspect-q1"}}
+    initial_state: QueryState = {
+        "question": question,
+        "detected_entities": [],
+        "subgraph_triples": "",
+        "full_graph_triples": "",
+        "provenance": [],
+        "answer": "",
+        "reasoning_path": "",
+        "steps": [],
+    }
 
-    q_result = query_graph.invoke(
-        {
-            "question": question,
-            "detected_entities": [],
-            "subgraph_triples": "",
-            "full_graph_triples": "",
-            "provenance": [],
-            "answer": "",
-            "reasoning_path": "",
-            "steps": [],
-        },
-        q_config,
-    )
+    # ── Print initial state ─────────────────────────────────────────────
+    print(f"\n  ── Initial State ──────────────────────────────────────────────")
+    print(f"    question:           \"{question}\"")
+    print(f"    detected_entities:  (empty)")
+    print(f"    subgraph_triples:   (empty)")
+    print(f"    provenance:         (empty)")
+    print(f"    answer:             (empty)")
 
-    history = list(reversed(list(query_graph.get_state_history(q_config))))
+    result = graph.invoke(initial_state, config)
+    history = list(reversed(list(graph.get_state_history(config))))
 
-    step_num = 0
-    prev_values = {}
+    step_names = ["receive_question", "retrieve_subgraph", "generate_answer"]
+    step_descs = {
+        "receive_question": (
+            "Ask the LLM to identify key concepts in the question —"
+            " people, vehicles, locations, events, times — and return"
+            " them as a JSON array of search terms.",
+            "Entity detection drives targeted graph retrieval. Instead"
+            " of dumping the whole graph to the LLM, we find the"
+            " relevant subgraph first."
+        ),
+        "retrieve_subgraph": (
+            "For each detected entity, searched Neo4j for matching nodes"
+            " (case-insensitive substring) and expanded to a 2-hop"
+            " neighbourhood. Also retrieved the SOSA/PROV provenance"
+            " chain (Observation → MADE_BY → witness, OBSERVED → events).",
+            "Targeted retrieval provides focused context. The SOSA/PROV"
+            " layer lets the LLM distinguish statement facts from"
+            " follow-up facts and cite observation-level provenance."
+        ),
+        "generate_answer": (
+            "Sent the subgraph triples + full graph + provenance summary"
+            " to the LLM with a prompt requiring: (1) answer only from"
+            " graph facts, (2) cite facts as [FACT: …], (3) show"
+            " reasoning path, (4) distinguish stated/follow-up/inferred.",
+            "Grounding prevents hallucination. Every claim must trace"
+            " back to a graph triple. The provenance summary lets the"
+            " LLM report confidence levels."
+        ),
+    }
 
+    step_idx = 0
+    prev_vals = dict(initial_state)
     for cp in history:
         vals = cp.values
-        steps = vals.get("steps", [])
-        if not steps and not vals.get("detected_entities"):
-            prev_values = dict(vals)
+        current_steps = vals.get("steps", [])
+
+        if len(current_steps) <= len(prev_vals.get("steps", [])):
             continue
 
-        latest_step = steps[-1] if steps else None
-        if latest_step and latest_step == (prev_values.get("steps", []) or [""])[-1]:
-            prev_values = dict(vals)
-            continue
+        if step_idx < len(step_names):
+            name = step_names[step_idx]
+            action_desc, why = step_descs[name]
 
-        step_num += 1
+            print(f"\n  ── Step {step_idx + 1}: {name} ─────────────────────────────────")
+            print(f"  Action:  {action_desc}")
+            print(f"  Why:     {why}")
+            print(f"\n  State changes:")
+            _print_state_diff(prev_vals, vals)
 
-        if vals.get("detected_entities") and not prev_values.get("detected_entities"):
-            entities = vals["detected_entities"]
-            print(f"\n  ── Step {step_num}: Detect Entities ─────────────────────────────────")
-            print(f"  Given:   The question text.")
-            print(f"  Action:  Asked the LLM to identify key concepts: people, vehicles,")
-            print(f"           locations, events, times, and objects mentioned. Returns")
-            print(f"           a JSON array of search terms.")
-            print(f"  Result:  {len(entities)} entities: {entities}")
-            print(f"  Why:     Entity detection drives targeted graph retrieval. Instead")
-            print(f"           of dumping the whole graph, we find the relevant subgraph.")
+            step_idx += 1
 
-        elif vals.get("subgraph_triples") and not prev_values.get("subgraph_triples"):
-            sub = vals["subgraph_triples"]
-            prov = vals.get("provenance", [])
-            sub_count = sub.count("\n") + 1 if sub != "(no matches)" else 0
-            print(f"\n  ── Step {step_num}: Retrieve Subgraph ──────────────────────────────")
-            print(f"  Given:   Detected entities: {vals.get('detected_entities', [])}")
-            print(f"  Action:  For each entity, searched Neo4j for nodes with matching")
-            print(f"           descriptions (case-insensitive substring), then expanded")
-            print(f"           to a 2-hop neighbourhood. Also collected provenance records")
-            print(f"           (source text for each fact).")
-            print(f"  Result:  {sub_count} relevant triples, {len(prov)} provenance records")
-            print(f"  Why:     Targeted retrieval provides focused context to the LLM.")
-            print(f"           The full graph is also provided as fallback context.")
+        prev_vals = dict(vals)
 
-        elif vals.get("answer") and not prev_values.get("answer"):
-            answer = vals["answer"]
-            print(f"\n  ── Step {step_num}: Generate Grounded Answer ────────────────────────")
-            print(f"  Given:   The relevant subgraph triples + full graph as context.")
-            print(f"  Action:  Sent both to the LLM with a prompt requiring:")
-            print(f"           - Answer ONLY from graph facts (no LLM knowledge)")
-            print(f"           - Cite facts as [FACT: ...]")
-            print(f"           - Show reasoning path through the graph")
-            print(f"           - Distinguish certain vs inferred facts")
-            print(f"  Result:  \"{answer[:120]}{'…' if len(answer) > 120 else ''}\"")
-            print(f"  Why:     Grounding prevents hallucination. Every claim must trace")
-            print(f"           back to a graph triple. The reasoning path shows exactly")
-            print(f"           which nodes and relationships were traversed.")
-
-        prev_values = dict(vals)
-
-    print(f"\n  ── Audit Trail ───────────────────────────────────────────────")
-    for i, s in enumerate(q_result.get("steps", []), 1):
-        print(f"    {i}. {s}")
+    # ── Print the answer ────────────────────────────────────────────────
+    answer = result.get("answer", "")
+    print(f"\n  ── Answer ────────────────────────────────────────────────────")
+    for line in answer.split("\n"):
+        print(f"    {line}")
     print()
 
 
 def main():
     print("=" * 70)
     print("  Module 06: Event Digital Twin — Agent Run Records")
-    print("  A readable log of what the agent was given, did, and why.")
+    print("  Full state changes at every step of the pipeline.")
     print("=" * 70)
 
     _narrate_ingest()

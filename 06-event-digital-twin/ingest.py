@@ -33,7 +33,9 @@ from schema import (
     build_extraction_prompt,
     init_database,
     linearise_graph,
+    materialise_provenance,
     NODE_TYPES,
+    ONTOLOGY_META,
     RELATIONSHIP_TYPES,
 )
 
@@ -361,11 +363,12 @@ def load_to_graph(state: IngestState) -> dict:
             )
             id_to_desc[entity_id] = desc_key
 
-            # Add provenance
+            # Add provenance (PROV-O: prov:wasGeneratedBy)
             props["source"] = "original_statement"
             props["source_type"] = "statement"
             props["extracted_at"] = timestamp
             props["confidence"] = "high"
+            props["ontology_id"] = ONTOLOGY_META["id"]
 
             # Filter to safe property names only
             safe_props = {
@@ -424,6 +427,14 @@ def load_to_graph(state: IngestState) -> dict:
     summary_msg = f"Loaded {created_nodes} nodes and {created_rels} relationships"
     print(f"  ✓ {summary_msg}")
 
+    # ── Materialise SOSA/PROV layer ─────────────────────────────────────
+    prov_msg = materialise_provenance(
+        driver,
+        source_type="statement",
+        observation_desc="Original witness statement",
+        observation_type="witness_statement",
+    )
+
     # ── Print resulting graph ───────────────────────────────────────────
     graph_view = linearise_graph(driver)
     print(f"\n  ── Graph ──")
@@ -431,9 +442,10 @@ def load_to_graph(state: IngestState) -> dict:
         print(f"    {line}")
 
     return {
-        "load_summary": summary_msg,
+        "load_summary": f"{summary_msg}; {prov_msg}",
         "steps": state.get("steps", []) + [
-            f"load_to_graph: {summary_msg}"
+            f"load_to_graph: {summary_msg}",
+            f"load_to_graph: {prov_msg}",
         ],
     }
 

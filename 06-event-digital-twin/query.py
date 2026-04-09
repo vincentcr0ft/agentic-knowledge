@@ -2,9 +2,11 @@
 06 · Event Digital Twin — Query Pipeline
 ═════════════════════════════════════════
 
-Queryable interface over the completed event graph. Receives natural-language
-questions, retrieves relevant subgraphs, and generates answers grounded
-exclusively in graph facts — never from the LLM's own knowledge.
+Queryable interface over the completed event graph. The user "queries the
+witness" — asking natural-language questions about the event. Answers are
+grounded exclusively in the knowledge graph (never from the LLM's own
+knowledge) and cite specific graph facts, observation provenance, and
+confidence levels.
 
 Pipeline (LangGraph):
 
@@ -13,6 +15,7 @@ Pipeline (LangGraph):
 Key design (per research):
   - Linearised triples for LLM consumption (Dai et al.)
   - Provenance citations — every claim cites the graph facts that support it
+  - SOSA/PROV awareness — answers reference observation source and confidence
   - KAPING-style fact prepending (Baek et al.)
   - MindMap-style reasoning paths (Wen et al.)
 
@@ -131,7 +134,8 @@ def retrieve_subgraph(state: QueryState) -> dict:
     Strategy:
     1. Full-text search for entities mentioned in the question
     2. Expand to 2-hop neighbourhood from matched nodes
-    3. Collect provenance (source text) for each matched fact
+    3. Collect provenance via SOSA/PROV layer (Observation nodes,
+       DERIVED_FROM edges, confidence levels)
     4. Also provide the full graph as fallback context
     """
     entities = state.get("detected_entities", [])
@@ -155,12 +159,13 @@ def retrieve_subgraph(state: QueryState) -> dict:
                     labels(n)[0] AS start_label,
                     coalesce(n.description, n.name_or_description,
                              n.name, n.value, n.summary) AS start_desc,
-                    n.source AS start_source,
                     n.source_type AS start_source_type,
+                    n.confidence AS start_confidence,
                     labels(m)[0] AS end_label,
                     coalesce(m.description, m.name_or_description,
                              m.name, m.value, m.summary) AS end_desc,
-                    m.source AS end_source,
+                    m.source_type AS end_source_type,
+                    m.confidence AS end_confidence,
                     rel_types
                 LIMIT 30
             """
@@ -177,30 +182,69 @@ def retrieve_subgraph(state: QueryState) -> dict:
                         )
                         matched_triples.append(triple)
 
-                        # Collect provenance
-                        for source_key in ("start_source", "end_source"):
-                            src = rec_dict.get(source_key)
-                            src_type = rec_dict.get(
-                                source_key.replace("source", "source_type"), ""
-                            )
-                            if src:
+                        # Collect provenance from source_type + confidence
+                        for prefix in ("start", "end"):
+                            src_type = rec_dict.get(f"{prefix}_source_type")
+                            confidence = rec_dict.get(f"{prefix}_confidence")
+                            desc = rec_dict.get(f"{prefix}_desc", "")
+                            if src_type:
                                 provenance_records.append({
-                                    "source": src,
-                                    "source_type": src_type or "unknown",
+                                    "entity": desc,
+                                    "source_type": src_type,
+                                    "confidence": confidence or "unknown",
                                 })
             except Exception as e:
                 print(f"    ⚠ Retrieval error for '{entity_term}': {e}")
+
+        # ── Pull SOSA/PROV provenance chain ─────────────────────────────
+        # Retrieve Observation nodes and their links to provide the LLM
+        # with observation-level context (who made it, what was observed)
+        prov_cypher = """
+            MATCH (obs:Observation)-[:MADE_BY]->(w:Person)
+            OPTIONAL MATCH (obs)-[:OBSERVED]->(e:Event)
+            RETURN obs.description AS observation,
+                   obs.observation_type AS obs_type,
+                   obs.confidence AS obs_confidence,
+                   w.name_or_description AS witness,
+                   w.role AS witness_role,
+                   collect(DISTINCT e.description) AS events_observed
+        """
+        try:
+            for rec in session.run(prov_cypher):
+                rec_dict = dict(rec)
+                if rec_dict.get("observation"):
+                    obs_desc = rec_dict["observation"]
+                    witness = rec_dict.get("witness", "unknown")
+                    events = rec_dict.get("events_observed", [])
+                    matched_triples.append(
+                        f"(Observation: {obs_desc}) -[MADE_BY]-> "
+                        f"(Person: {witness})"
+                    )
+                    for evt in events:
+                        matched_triples.append(
+                            f"(Observation: {obs_desc}) -[OBSERVED]-> "
+                            f"(Event: {evt})"
+                        )
+                    provenance_records.append({
+                        "entity": obs_desc,
+                        "source_type": rec_dict.get("obs_type", "unknown"),
+                        "confidence": rec_dict.get("obs_confidence", "unknown"),
+                        "witness": witness,
+                    })
+        except Exception as e:
+            print(f"    ⚠ Provenance retrieval error: {e}")
 
     # Deduplicate triples
     unique_triples = list(dict.fromkeys(matched_triples))
     subgraph_text = "\n".join(unique_triples) if unique_triples else "(no matches)"
 
     # Deduplicate provenance
-    seen_sources = set()
+    seen_prov = set()
     unique_prov = []
     for p in provenance_records:
-        if p["source"] not in seen_sources:
-            seen_sources.add(p["source"])
+        key = f"{p.get('entity', '')}::{p.get('source_type', '')}"
+        if key not in seen_prov:
+            seen_prov.add(key)
             unique_prov.append(p)
 
     # Full graph as fallback
@@ -225,9 +269,13 @@ def retrieve_subgraph(state: QueryState) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 ANSWER_PROMPT = """\
-You are an investigative analyst answering questions about a witnessed event. \
-You must answer ONLY from the knowledge graph facts provided below — never \
-from your own knowledge.
+You are an investigative analyst. The user is querying a knowledge graph \
+built from a witness's account of an event. Your answers must be grounded \
+ONLY in the graph facts provided below — never in your own knowledge.
+
+The graph was constructed from a formal witness statement and may have been \
+enriched through follow-up interview questions. Facts have provenance \
+(source_type: "statement" or "interview_round_N") and confidence levels.
 
 RELEVANT SUBGRAPH (directly related to the question):
 {subgraph}
@@ -235,30 +283,54 @@ RELEVANT SUBGRAPH (directly related to the question):
 FULL EVENT GRAPH (for additional context):
 {full_graph}
 
+PROVENANCE SUMMARY:
+{provenance}
+
 RULES:
 1. Ground every claim in specific graph facts — cite them as [FACT: ...]
-2. If the graph does not contain enough information to answer, say so clearly
+2. If the graph does not contain enough information to answer, say so \
+clearly — do NOT speculate
 3. Show your REASONING PATH — which graph nodes and relationships you \
 traversed to reach your answer
-4. Distinguish between facts that are CERTAIN (directly stated) and those \
-that are INFERRED (derived from connections)
-5. Be precise and investigative in tone
-6. If there are gaps or uncertainties in the graph, mention them"""
+4. Distinguish between:
+   - STATED facts (from the original witness statement, confidence: high)
+   - FOLLOW-UP facts (from interview answers, confidence: medium)
+   - INFERRED connections (derived from graph structure)
+5. If there are gaps or uncertainties in the graph, mention them — these \
+represent things the witness could not confirm
+6. Be precise and investigative in tone
+7. Reference the witness's perspective — this is their account of events"""
 
 
 def generate_answer(state: QueryState) -> dict:
     """Generate a grounded answer with citations and reasoning path.
 
     Uses KAPING-style fact prepending: relevant subgraph first, then
-    full graph as context.  Answer must cite specific graph facts.
+    full graph as context. Includes SOSA/PROV provenance so the LLM
+    can distinguish statement facts from follow-up facts.
     """
     question = state["question"]
     subgraph = state.get("subgraph_triples", "")
     full_graph = state.get("full_graph_triples", "")
+    prov = state.get("provenance", [])
+
+    # Format provenance for the prompt
+    prov_lines = []
+    for p in prov:
+        entity = p.get("entity", "?")
+        src = p.get("source_type", "unknown")
+        conf = p.get("confidence", "unknown")
+        witness = p.get("witness", "")
+        line = f"  • {entity} — source: {src}, confidence: {conf}"
+        if witness:
+            line += f", observer: {witness}"
+        prov_lines.append(line)
+    prov_text = "\n".join(prov_lines) if prov_lines else "(no provenance data)"
 
     prompt = ANSWER_PROMPT.format(
         subgraph=subgraph,
         full_graph=full_graph,
+        provenance=prov_text,
     )
 
     messages = [
@@ -343,39 +415,37 @@ def ask(question: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CLI — interactive query loop + demo questions
+# CLI — interactive query session
 # ═══════════════════════════════════════════════════════════════════════════
 
-DEMO_QUESTIONS = [
-    "What happened at the junction of King Street and Queen's Road?",
-    "Can you describe the suspect and what vehicle they were driving?",
-    "What is the timeline of events?",
-    "Who called the ambulance and what happened to the cyclist?",
-    "In which direction did the suspect flee?",
-]
 
-
-def run_demo():
-    """Run the demo questions against the current graph."""
+def run_interactive():
+    """Run an interactive query session — the user queries the witness."""
     graph = build_query_graph()
 
     print(f"{'═' * 70}")
-    print(f"  EVENT DIGITAL TWIN — QUERY PHASE")
+    print(f"  EVENT DIGITAL TWIN — QUERY THE WITNESS")
     print(f"{'═' * 70}")
 
-    # Show current graph state
+    # Show current graph summary
     triples = linearise_graph(driver)
-    print(f"\n  Current graph ({triples.count(chr(10)) + 1} triples):")
-    for line in triples.split("\n"):
-        print(f"    {line}")
-    print()
+    triple_count = triples.count("\n") + 1 if triples != "(empty graph)" else 0
+    print(f"\n  The knowledge graph contains {triple_count} triples built from")
+    print(f"  the witness's statement and any follow-up interview answers.")
+    print(f"  Ask anything about the event. Type 'quit' to exit.\n")
 
-    for i, question in enumerate(DEMO_QUESTIONS, 1):
-        config = {"configurable": {"thread_id": f"demo-{i}"}}
+    query_num = 0
+    while True:
+        try:
+            question = input("  You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
 
-        print(f"{'─' * 70}")
-        print(f"  Q{i}: {question}")
-        print(f"{'─' * 70}")
+        if not question or question.lower() in ("quit", "exit", "q", "done"):
+            break
+
+        query_num += 1
+        config = {"configurable": {"thread_id": f"interactive-{query_num}"}}
 
         initial_state: QueryState = {
             "question": question,
@@ -388,52 +458,28 @@ def run_demo():
             "steps": [],
         }
 
+        print()
         result = graph.invoke(initial_state, config)
 
-        print(f"\n  Answer:\n")
-        for line in result.get("answer", "").split("\n"):
-            print(f"    {line}")
-        print()
-
-        # Provenance
-        prov = result.get("provenance", [])
-        if prov:
-            print(f"  Sources:")
-            for p in prov[:5]:
-                print(f"    [{p.get('source_type', '?')}] {p.get('source', '?')}")
-            if len(prov) > 5:
-                print(f"    … and {len(prov) - 5} more")
-        print()
-
-
-def run_interactive():
-    """Run an interactive query session."""
-    print(f"{'═' * 70}")
-    print(f"  EVENT DIGITAL TWIN — QUERY PHASE (interactive)")
-    print(f"{'═' * 70}")
-    print(f"  Ask questions about the event. Type 'quit' to exit.\n")
-
-    while True:
-        try:
-            question = input("  Question: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-
-        if not question or question.lower() in ("quit", "exit", "q"):
-            break
-
-        print()
-        answer = ask(question)
-        print(f"\n  Answer:\n")
+        answer = result.get("answer", "No answer generated.")
+        print(f"\n  Witness account:\n")
         for line in answer.split("\n"):
             print(f"    {line}")
+
+        # Show provenance summary
+        prov = result.get("provenance", [])
+        if prov:
+            sources = set()
+            for p in prov:
+                src = p.get("source_type", "")
+                conf = p.get("confidence", "")
+                if src:
+                    sources.add(f"{src} ({conf})" if conf else src)
+            if sources:
+                print(f"\n  Sources: {', '.join(sorted(sources))}")
+
         print()
 
 
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
-        run_interactive()
-    else:
-        run_demo()
+    run_interactive()

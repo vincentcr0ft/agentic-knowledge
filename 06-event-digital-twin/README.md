@@ -81,34 +81,61 @@ Particularly relevant section on **Event KGs**:
 
 ## Domain Schema: Witness Statement Ontology
 
-The gap analysis engine needs a **target schema** — a model of what a "complete" event description looks like. Based on standard investigative frameworks (5W1H: Who, What, When, Where, Why, How):
+The gap analysis engine needs a **target schema** — a model of what a "complete" event description looks like. Based on standard investigative frameworks (5W1H: Who, What, When, Where, Why, How), the schema composites three W3C/community standards:
+
+### Ontology Layers
+
+| Layer | Standard | Role in Schema |
+|-------|----------|----------------|
+| **Provenance** | PROV-O (W3C) | Every node carries `source`, `source_type`, `extracted_at`, `ontology_id` properties (prov:wasGeneratedBy). `DERIVED_FROM` relationships track lineage from Event → Observation |
+| **Observation** | SOSA/SSN (W3C) | Witness modelled as sosa:Sensor, the statement as sosa:Observation, events as sosa:FeatureOfInterest. `MADE_BY` and `OBSERVED` relationships link the observation model. Enables confidence/conditions tracking per observation |
+| **Event structure** | Schema.org Event | Events as first-class nodes with temporal/spatial anchoring, participants, sub-event ordering via `PRECEDED`/`CAUSED` |
+
+The SOSA/PROV layer is **system-managed** — it is materialised programmatically after LLM extraction, not extracted by the LLM itself. This keeps the extraction prompt focused on domain entities while ensuring full provenance coverage.
+
+Each ontology configuration is identified by `ONTOLOGY_META` in `schema.py`, which carries an `id`, `version`, and layer descriptions. Every node is stamped with `ontology_id` to support future comparison of different ontology configurations against the same source material.
 
 ### Node Types
 
-| Label | Required Properties | Description |
-|-------|-------------------|-------------|
-| **Event** | description, type (incident/observation/action) | Central node — something that happened |
-| **Person** | name or description, role (witness/suspect/victim/bystander) | Human participant |
-| **Vehicle** | description, colour, make, model, registration | Vehicle involved |
-| **Location** | description, type (street/building/area) | Where something happened |
-| **Time** | value, precision (exact/approximate/relative) | When something happened |
-| **Object** | description, type (weapon/clothing/item) | Physical object mentioned |
-| **PhysicalDescription** | height, build, hair, clothing, distinguishing_features | Appearance of a person |
+| Label | Required Properties | Ontology Mapping | Description |
+|-------|-------------------|------------------|-------------|
+| **Event** | description, type | schema:Event + prov:Entity | Central node — something that happened |
+| **Person** | name_or_description, role | schema:Person + prov:Agent (witness → sosa:Sensor) | Human participant: witness, suspect, victim, bystander |
+| **Vehicle** | description | schema:Vehicle + prov:Entity | Vehicle involved in or mentioned during events |
+| **Location** | description | schema:Place | Where something happened — street, building, area |
+| **Time** | value | schema:DateTime | When something happened — exact, approximate, or relative |
+| **Object** | description | prov:Entity | Physical object mentioned: weapon, clothing item, etc. |
+| **PhysicalDescription** | summary | evt:PhysicalDescription | Appearance of a person — physical and clothing details |
+| **Observation** | description, observation_type | sosa:Observation + prov:Activity | System-managed — the witness statement or follow-up round as a structured observation |
 
 ### Relationship Types
 
-| Type | From → To | Description |
-|------|-----------|-------------|
-| **PARTICIPATED_IN** | Person → Event | Someone was involved |
-| **WITNESSED** | Person → Event | Someone observed |
-| **OCCURRED_AT** | Event → Location | Where it happened |
-| **OCCURRED_AT_TIME** | Event → Time | When it happened |
-| **USED** | Person → Object/Vehicle | Someone used something |
-| **DESCRIBED_AS** | Person → PhysicalDescription | Appearance |
-| **CAUSED** | Event → Event | Causal chain |
-| **PRECEDED** | Event → Event | Temporal ordering |
-| **LOCATED_NEAR** | Location → Location | Spatial relation |
-| **OWNED_BY** | Vehicle/Object → Person | Ownership |
+| Type | From → To | Ontology Mapping | Description |
+|------|-----------|------------------|-------------|
+| **PARTICIPATED_IN** | Person → Event | schema:participant (inverse) | Someone was directly involved |
+| **WITNESSED** | Person → Event | sosa:madeBySensor (inverse) | Someone observed the event (witness-as-sensor) |
+| **OCCURRED_AT** | Event → Location | schema:location | Where it happened |
+| **OCCURRED_AT_TIME** | Event → Time | schema:startDate/endDate | When it happened |
+| **USED** | Person → Object | prov:used | Someone used an object |
+| **DROVE** | Person → Vehicle | evt:drove | Someone was driving a vehicle |
+| **DESCRIBED_AS** | Person → PhysicalDescription | evt:describedAs | Appearance description |
+| **CAUSED** | Event → Event | evt:caused | Causal chain |
+| **PRECEDED** | Event → Event | evt:preceded | Temporal ordering |
+| **LOCATED_NEAR** | Location → Location | schema:geo (qualitative) | Spatial proximity |
+| **OWNED_BY** | Vehicle → Person | schema:ownedBy | Ownership |
+| **OBSERVED** | Observation → Event | sosa:hasFeatureOfInterest | What the observation is about (system-managed) |
+| **MADE_BY** | Observation → Person | sosa:madeBySensor | Who made the observation (system-managed) |
+| **DERIVED_FROM** | Event → Observation | prov:wasDerivedFrom | Provenance lineage (system-managed) |
+
+### Provenance Properties (stamped on every node)
+
+| Property | Description |
+|----------|-------------|
+| `source` | Source text (sentence or answer) this fact was extracted from |
+| `source_type` | One of: `statement` \| `interview_round_N` |
+| `extracted_at` | ISO-8601 timestamp of extraction |
+| `confidence` | Extraction confidence: `high` \| `medium` \| `low` |
+| `ontology_id` | Identifier of the ontology used (`witness-statement-v1`) |
 
 ### Completeness Rules
 
@@ -190,19 +217,19 @@ These define what "gaps" look like — conditions that should be true for a comp
 | Node | Purpose |
 |------|---------|
 | `parse_statement` | Clean and segment the raw statement text into paragraphs/sentences |
-| `extract_entities` | Schema-guided extraction — LLM identifies entities and relationships matching the ontology. Uses the extraction pattern from Module 05 but with the witness statement schema |
+| `extract_entities` | Schema-guided extraction — LLM identifies entities and relationships matching the ontology (Schema.org Event layer). Observation/PROV nodes are excluded from LLM extraction — they are system-managed |
 | `resolve_entities` | Merge duplicates ("the man", "he", "the suspect" → same Person node). Uses coreference resolution via LLM |
-| `load_to_graph` | Create nodes and relationships in Neo4j. Tag each fact with its source (which sentence of the statement) |
+| `load_to_graph` | Create nodes and relationships in Neo4j. Stamp each node with provenance properties (`source_type`, `ontology_id`, etc.). Then **materialise the SOSA/PROV layer**: create an Observation node for the statement, link it to the witness via `MADE_BY` and to all Events via `OBSERVED`/`DERIVED_FROM` |
 
 ### Phase 2: Interview (the novel part)
 
 | Node | Purpose |
 |------|---------|
-| `analyse_gaps` | Query the graph against completeness rules. For each rule violation, record a gap: `{type: "missing_time", entity: "Event:collision", rule: "Events must have timestamps"}` |
-| `generate_questions` | LLM generates natural language questions targeting the specific gaps. Prioritises high-value gaps (events without times/locations before suspects without hair colour) |
-| `[INTERRUPT]` | Agent pauses. Questions are presented to the user. User answers in natural language |
-| `extract_from_answers` | LLM extracts new entities/relationships from the user's answers, using the same schema-guided extraction |
-| `update_graph` | Merge new facts into the graph. Re-run entity resolution. Return to `analyse_gaps` |
+| `analyse_gaps` | Query the graph against completeness rules (schema, narrative coherence, investigative completeness). For each violation, record a gap with priority |
+| `attempt_self_resolution` | Before asking the witness, check if the original text + previous answers already contain the needed information (e.g. a time mentioned once applies to multiple events) |
+| `generate_questions` | LLM generates one targeted question for the highest-priority remaining gap, including a `_reason` field explaining why it's being asked |
+| `collect_answers` | `interrupt()` pauses the graph — the question is presented to the user, who answers in natural language |
+| `extract_from_answers` | LLM extracts new entities/relationships from the answer. New nodes get provenance stamped with `interview_round_N`. The SOSA/PROV layer is materialised for each round (new Observation → `MADE_BY`/`OBSERVED`/`DERIVED_FROM`) |
 
 **Loop termination**: The interview phase ends when either (a) no gaps remain, (b) a maximum number of interview rounds is reached, or (c) the user indicates they have no more information.
 
@@ -281,11 +308,12 @@ Priority ordering:
 | File | Purpose |
 |------|---------|
 | `README.md` | Concepts: event ontology, gap analysis, conversational KG construction |
-| `schema.py` | Domain ontology definition — node types, relationship types, completeness rules, all as data structures |
-| `ingest.py` | Ingest pipeline — extraction, resolution, graph loading |
-| `interview.py` | Interview loop — gap analysis, question generation, answer extraction |
+| `schema.py` | Domain ontology definition — node types, relationship types, completeness rules, SOSA/PROV materialisation, ontology registry |
+| `ingest.py` | Ingest pipeline — extraction, resolution, graph loading, provenance materialisation |
+| `interview.py` | Interview loop — gap analysis, self-resolution, question generation, answer extraction, per-round provenance |
 | `query.py` | Query interface — subgraph retrieval, grounded answer generation |
 | `demo.py` | Full end-to-end demo orchestrating all three phases |
+| `inspect_state.py` | Human-readable narrative of agent reasoning at each pipeline step |
 | `statements/` | Sample witness statement texts for testing |
 
 ### State Schema
@@ -358,8 +386,10 @@ Expected gap analysis would identify:
 - **Sovereign stack**: Same as existing modules — ChatOllama with qwen2.5:7b, Neo4j at bolt://localhost:7687
 - **No external APIs**: Everything runs locally
 - **Human-in-the-loop**: Uses LangGraph's interrupt mechanism for the interview phase
-- **Provenance**: Every fact in the graph carries a `source` property linking back to the original text or interview round that produced it
-- **Idempotent re-ingestion**: Running the same statement through ingest twice should not duplicate the graph
+- **Provenance (PROV-O)**: Every node carries `source`, `source_type`, `extracted_at`, `confidence`, and `ontology_id`. `DERIVED_FROM` relationships link Events back to the Observation they came from
+- **Observation model (SOSA/SSN)**: The witness statement and each follow-up interview round are materialised as `Observation` nodes linked to the witness (`MADE_BY`) and to the events they describe (`OBSERVED`). This layer is system-managed, not LLM-extracted
+- **Ontology versioning**: Every node is stamped with `ontology_id` from `ONTOLOGY_META`. The ontology definition is a single source of truth in `schema.py`, designed to be swappable for future A/B comparison of different ontology configurations against the same source material
+- **Idempotent re-ingestion**: Running the same statement through ingest twice should not duplicate the graph (MERGE-based loading)
 
 ---
 

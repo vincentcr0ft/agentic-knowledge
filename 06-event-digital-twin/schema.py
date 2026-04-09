@@ -35,6 +35,30 @@ NAMESPACES = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Ontology registry — identifies the active ontology for comparison/testing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ONTOLOGY_META = {
+    "id": "witness-statement-v1",
+    "version": "1.0",
+    "name": "Witness Statement Event Ontology",
+    "layers": [
+        {"standard": "PROV-O",           "role": "Provenance tracking and lineage"},
+        {"standard": "SOSA/SSN",         "role": "Observation model — witness as sensor"},
+        {"standard": "Schema.org Event", "role": "Event structure with temporal/spatial anchoring"},
+    ],
+    "description": (
+        "Composites PROV-O, SOSA/SSN, and Schema.org Event into a "
+        "three-layer ontology for witness statement analysis. Every node "
+        "carries provenance properties (PROV-O), the witness statement is "
+        "modelled as a structured Observation (SOSA), and events are "
+        "first-class nodes with temporal/spatial/participant anchoring "
+        "(Schema.org Event)."
+    ),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Node type definitions
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -245,7 +269,142 @@ PROVENANCE_PROPS = {
     "source_type":   "One of: statement | interview_round_N",
     "extracted_at":  "ISO-8601 timestamp of extraction",
     "confidence":    "Extraction confidence: high | medium | low",
+    "ontology_id":   "Identifier of the ontology used to produce this node",
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOSA/PROV materialisation — create Observation nodes and provenance edges
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def materialise_provenance(
+    driver: GraphDatabase.driver,
+    source_type: str,
+    observation_desc: str,
+    observation_type: str = "witness_statement",
+    witness_desc: str | None = None,
+) -> str:
+    """Create the SOSA Observation node and PROV-O lineage edges.
+
+    This is the "system-managed" counterpart to LLM extraction — it
+    programmatically instantiates the SOSA/PROV layer that the LLM
+    extraction prompt intentionally skips.
+
+    Creates:
+      (Observation) — sosa:Observation + prov:Activity
+      (Observation)-[:MADE_BY]->(Person{role:'witness'}) — sosa:madeBySensor
+      (Observation)-[:OBSERVED]->(Event) — sosa:hasFeatureOfInterest
+      (Event)-[:DERIVED_FROM]->(Observation) — prov:wasDerivedFrom
+
+    Args:
+        driver:           Neo4j driver.
+        source_type:      Provenance tag to match nodes, e.g. "statement"
+                          or "interview_round_1".
+        observation_desc: Human-readable label for the Observation node.
+        observation_type: One of "witness_statement" | "follow_up".
+        witness_desc:     name_or_description of the witness Person. If
+                          None, auto-detects the Person with role='witness'.
+
+    Returns:
+        Summary string of what was created.
+    """
+    from datetime import datetime, timezone
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    ontology_id = ONTOLOGY_META["id"]
+    created_obs = 0
+    created_rels = 0
+
+    with driver.session() as session:
+        # ── 1. Create the Observation node ──────────────────────────────
+        session.run(
+            "MERGE (obs:Observation {description: $desc}) "
+            "SET obs.observation_type = $obs_type, "
+            "    obs.source_type     = $src_type, "
+            "    obs.extracted_at    = $ts, "
+            "    obs.confidence      = 'high', "
+            "    obs.ontology_id     = $ont_id",
+            desc=observation_desc,
+            obs_type=observation_type,
+            src_type=source_type,
+            ts=timestamp,
+            ont_id=ontology_id,
+        )
+        created_obs = 1
+
+        # ── 2. MADE_BY — link Observation to witness (sosa:madeBySensor)
+        if witness_desc:
+            result = session.run(
+                "MATCH (obs:Observation {description: $obs_desc}) "
+                "MATCH (w:Person {name_or_description: $w_desc}) "
+                "MERGE (obs)-[:MADE_BY]->(w)",
+                obs_desc=observation_desc,
+                w_desc=witness_desc,
+            )
+            created_rels += result.consume().counters.relationships_created
+        else:
+            # Auto-detect witness
+            result = session.run(
+                "MATCH (obs:Observation {description: $obs_desc}) "
+                "MATCH (w:Person {role: 'witness'}) "
+                "MERGE (obs)-[:MADE_BY]->(w)",
+                obs_desc=observation_desc,
+            )
+            created_rels += result.consume().counters.relationships_created
+
+        # ── 3. OBSERVED — link Observation to each Event ────────────────
+        #    For "statement" source, link to ALL events.
+        #    For interview rounds, link to events touched in that round.
+        if source_type == "statement":
+            result = session.run(
+                "MATCH (obs:Observation {description: $obs_desc}) "
+                "MATCH (e:Event) "
+                "MERGE (obs)-[:OBSERVED]->(e)",
+                obs_desc=observation_desc,
+            )
+        else:
+            # Link to events that have nodes connected in this round
+            result = session.run(
+                "MATCH (obs:Observation {description: $obs_desc}) "
+                "MATCH (e:Event) "
+                "WHERE e.source_type = $src_type "
+                "   OR EXISTS { "
+                "     MATCH (e)-[]-(n) WHERE n.source_type = $src_type "
+                "   } "
+                "MERGE (obs)-[:OBSERVED]->(e)",
+                obs_desc=observation_desc,
+                src_type=source_type,
+            )
+        created_rels += result.consume().counters.relationships_created
+
+        # ── 4. DERIVED_FROM — Event back-links to Observation ───────────
+        if source_type == "statement":
+            result = session.run(
+                "MATCH (obs:Observation {description: $obs_desc}) "
+                "MATCH (e:Event) "
+                "MERGE (e)-[:DERIVED_FROM]->(obs)",
+                obs_desc=observation_desc,
+            )
+        else:
+            result = session.run(
+                "MATCH (obs:Observation {description: $obs_desc}) "
+                "MATCH (e:Event) "
+                "WHERE e.source_type = $src_type "
+                "   OR EXISTS { "
+                "     MATCH (e)-[]-(n) WHERE n.source_type = $src_type "
+                "   } "
+                "MERGE (e)-[:DERIVED_FROM]->(obs)",
+                obs_desc=observation_desc,
+                src_type=source_type,
+            )
+        created_rels += result.consume().counters.relationships_created
+
+    msg = (
+        f"Provenance: created Observation '{observation_desc}' "
+        f"with {created_rels} SOSA/PROV relationships"
+    )
+    print(f"  ✓ {msg}")
+    return msg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -634,6 +793,7 @@ CONSTRAINT_CYPHER = [
     "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Event) REQUIRE e.description IS UNIQUE",
     "CREATE CONSTRAINT IF NOT EXISTS FOR (l:Location) REQUIRE l.description IS UNIQUE",
     "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Time) REQUIRE t.value IS UNIQUE",
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (obs:Observation) REQUIRE obs.description IS UNIQUE",
 ]
 
 INDEX_CYPHER = [
@@ -641,6 +801,8 @@ INDEX_CYPHER = [
     "CREATE INDEX IF NOT EXISTS FOR (v:Vehicle) ON (v.description)",
     "CREATE INDEX IF NOT EXISTS FOR (o:Object) ON (o.description)",
     "CREATE INDEX IF NOT EXISTS FOR (pd:PhysicalDescription) ON (pd.summary)",
+    # Ontology comparison index — allows filtering nodes by ontology version
+    "CREATE INDEX IF NOT EXISTS FOR (n:Observation) ON (n.ontology_id)",
 ]
 
 
@@ -656,13 +818,22 @@ def init_database(driver: GraphDatabase.driver) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("Node types:")
+    print(f"Ontology: {ONTOLOGY_META['name']} (v{ONTOLOGY_META['version']})")
+    print(f"  ID: {ONTOLOGY_META['id']}")
+    for layer in ONTOLOGY_META["layers"]:
+        print(f"  Layer: {layer['standard']:20s} — {layer['role']}")
+
+    print("\nNode types:")
     for name, ndef in NODE_TYPES.items():
         print(f"  {name:25s}  ← {ndef.ontology_mapping}")
 
     print("\nRelationship types:")
     for name, rdef in RELATIONSHIP_TYPES.items():
         print(f"  ({rdef.from_label})-[{name}]->({rdef.to_label})  ← {rdef.ontology_mapping}")
+
+    print("\nProvenance properties (stamped on every node):")
+    for prop, desc in PROVENANCE_PROPS.items():
+        print(f"  {prop:15s} — {desc}")
 
     print("\nSchema completeness rules:")
     for rule in SCHEMA_COMPLETENESS_RULES:

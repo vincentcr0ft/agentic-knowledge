@@ -11,8 +11,7 @@ Orchestrates all three phases of the event digital twin:
 Usage:
   python demo.py <statement_file>          Full pipeline with a statement file
   python demo.py --interview               Interview only (graph must exist)
-  python demo.py --query                   Query demo (graph must exist)
-  python demo.py --interactive             Interactive query REPL
+  python demo.py --query                   Query only (graph must exist)
   python demo.py <file> --skip-interview   Ingest + query, no interview
 
 The system will:
@@ -37,7 +36,7 @@ from neo4j import GraphDatabase
 from schema import linearise_graph, run_schema_completeness, prioritise_gaps
 from ingest import ingest_statement
 from interview import run_interview
-from query import run_demo as run_query_demo, ask, run_interactive
+from query import ask, run_interactive
 
 
 # ─── Connections ──────────────────────────────────────────────────────────
@@ -164,17 +163,14 @@ def phase_interview(statement: str = "", transcript_path: str | None = None):
 # Phase 3 — Query
 # ═══════════════════════════════════════════════════════════════════════════
 
-def phase_query(interactive: bool = False):
-    """Run the query phase: questions → graph retrieval → grounded answers."""
+def phase_query():
+    """Run the query phase: user asks questions, graph retrieves grounded answers."""
     print(f"\n{'═' * 70}")
-    print(f"  PHASE 3: QUERY")
+    print(f"  PHASE 3: QUERY THE WITNESS")
     print(f"  Grounded Q&A over the event graph")
     print(f"{'═' * 70}\n")
 
-    if interactive:
-        run_interactive()
-    else:
-        run_query_demo()
+    run_interactive()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -191,8 +187,7 @@ Arguments:
 Options:
   --skip-interview  Run Phase 1 + Phase 3, skipping the interview
   --interview       Run only Phase 2 (interview) — assumes graph is populated
-  --query           Run only Phase 3 (query demo) — assumes graph is populated
-  --interactive     Run Phase 3 in interactive mode
+  --query           Run only Phase 3 (query) — assumes graph is populated
   --transcript FILE Write interview transcript to FILE (default: transcript.txt)
   --help            Show this help message
 
@@ -201,6 +196,7 @@ Examples:
   python demo.py                                   # interactive statement entry
   python demo.py statement.txt --skip-interview
   python demo.py --interview --transcript log.txt
+  python demo.py --query                           # query existing graph
 """
 
 
@@ -242,25 +238,22 @@ def main():
     if "--interview" in flags:
         phase_interview(transcript_path=transcript_path)
 
-    elif "--query" in flags:
-        phase_query(interactive=False)
-
-    elif "--interactive" in flags:
-        phase_query(interactive=True)
+    elif "--query" in flags or "--interactive" in flags:
+        phase_query()
 
     else:
         statement = load_statement(file_path)
 
         if "--skip-interview" in flags:
             phase_ingest(statement)
-            phase_query(interactive=False)
+            phase_query()
         else:
             phase_ingest(statement)
             phase_interview(
                 statement=statement,
                 transcript_path=transcript_path,
             )
-            phase_query(interactive=False)
+            phase_query()
 
     print(f"\n{'=' * 70}")
     print("  Key concepts demonstrated:")

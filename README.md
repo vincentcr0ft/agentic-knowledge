@@ -1,6 +1,6 @@
 # Agentic AI and Knowledge Graphs
 
-A five-module learning project exploring agentic AI systems, from fundamentals through to Graph RAG. Each module contains a concepts guide (README.md) and a runnable demonstration (demo.py).
+A nine-module learning project exploring agentic AI systems, from fundamentals through to event digital twins and cloud deployment. Each module contains a concepts guide (README.md) and a runnable demonstration (demo.py).
 
 ## Project Structure
 
@@ -11,17 +11,22 @@ A five-module learning project exploring agentic AI systems, from fundamentals t
 | [03-rag](03-rag/) | Retrieval-Augmented Generation | Chunking, embedding, vector search, self-corrective retrieval |
 | [04-knowledge-graphs](04-knowledge-graphs/) | Knowledge Graphs | Neo4j, Cypher, multi-hop traversal, NL-to-Cypher |
 | [05-graph-rag](05-graph-rag/) | Graph RAG | Entity extraction, KG construction, hybrid retrieval |
+| [06-ontologies](06-ontologies/) | Ontology Comparison | Pluggable ontologies, Schema.org vs SEM vs BFO/CCO, SHACL shapes |
+| [07-graph-quality](07-graph-quality/) | Graph Quality Assessment | Multi-dimensional probes, Cypher/LLM/SHACL validation, scoring |
+| [08-event-digital-twin](08-event-digital-twin/) | Event Digital Twin | Single & multi-source witness graphs, interview, fine-tuning with quality feedback |
+| [09-deployment](09-deployment/) | Deployment & Model Serving | Containers, cloud, model swapping, LoRA adapter serving |
 
-## Running the Demos
+## Getting Started
 
-All demos use the shared virtual environment and local sovereign stack:
+Each module includes a `docker-compose.yml` to start the required services:
 
 ```bash
 cd <module-folder>
+docker compose up -d          # start Ollama (+ Neo4j for modules 04-08)
 ../langgraph-test/langgraph-env/bin/python demo.py
 ```
 
-**Stack**: LangGraph 0.6.11 · Ollama (qwen2.5:7b) · Neo4j Community (modules 04-05)
+**Stack**: LangGraph 0.6.11 · Ollama (qwen2.5:7b) · Neo4j Community (modules 04-08)
 
 ---
 

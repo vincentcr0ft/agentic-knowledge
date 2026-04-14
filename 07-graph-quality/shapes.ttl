@@ -1,0 +1,164 @@
+@prefix sh:     <http://www.w3.org/ns/shacl#> .
+@prefix xsd:    <http://www.w3.org/2001/XMLSchema#> .
+@prefix evt:    <http://example.org/event-twin#> .
+@prefix schema: <https://schema.org/> .
+@prefix prov:   <http://www.w3.org/ns/prov#> .
+@prefix sosa:   <http://www.w3.org/ns/sosa/> .
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Event Shape
+# ═══════════════════════════════════════════════════════════════════════════════
+
+evt:EventShape a sh:NodeShape ;
+    sh:targetClass evt:Event ;
+    sh:property [
+        sh:path evt:description ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:message "Every Event must have a description" ;
+    ] ;
+    sh:property [
+        sh:path evt:type ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:in ( "incident" "observation" "action" "arrival" "departure"
+                "communication" "environmental" ) ;
+        sh:message "Event type must be one of the defined EVENT_TYPES" ;
+    ] ;
+    sh:property [
+        sh:path evt:OCCURRED_AT ;
+        sh:minCount 1 ;
+        sh:class evt:Location ;
+        sh:message "Every Event must be linked to at least one Location via OCCURRED_AT" ;
+    ] ;
+    sh:property [
+        sh:path evt:OCCURRED_AT_TIME ;
+        sh:minCount 1 ;
+        sh:class evt:Time ;
+        sh:message "Every Event must be linked to at least one Time via OCCURRED_AT_TIME" ;
+    ] .
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Person Shape
+# ═══════════════════════════════════════════════════════════════════════════════
+
+evt:PersonShape a sh:NodeShape ;
+    sh:targetClass evt:Person ;
+    sh:property [
+        sh:path evt:name_or_description ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:message "Every Person must have a name_or_description" ;
+    ] ;
+    sh:property [
+        sh:path evt:role ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:in ( "witness" "suspect" "victim" "bystander"
+                "first_responder" "reporting_officer" "driver" "passenger" ) ;
+        sh:message "Person role must be one of the defined PERSON_ROLES" ;
+    ] .
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Vehicle Shape
+# ═══════════════════════════════════════════════════════════════════════════════
+
+evt:VehicleShape a sh:NodeShape ;
+    sh:targetClass evt:Vehicle ;
+    sh:property [
+        sh:path evt:description ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:message "Every Vehicle must have a description" ;
+    ] .
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Location Shape
+# ═══════════════════════════════════════════════════════════════════════════════
+
+evt:LocationShape a sh:NodeShape ;
+    sh:targetClass evt:Location ;
+    sh:property [
+        sh:path evt:description ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:message "Every Location must have a description" ;
+    ] .
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Time Shape
+# ═══════════════════════════════════════════════════════════════════════════════
+
+evt:TimeShape a sh:NodeShape ;
+    sh:targetClass evt:Time ;
+    sh:property [
+        sh:path evt:value ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:message "Every Time node must have a value" ;
+    ] .
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Observation Shape (SOSA layer)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+evt:ObservationShape a sh:NodeShape ;
+    sh:targetClass evt:Observation ;
+    sh:property [
+        sh:path evt:description ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:message "Every Observation must have a description" ;
+    ] ;
+    sh:property [
+        sh:path evt:observation_type ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:message "Every Observation must have an observation_type" ;
+    ] ;
+    sh:property [
+        sh:path evt:MADE_BY ;
+        sh:minCount 1 ;
+        sh:class evt:Person ;
+        sh:message "Every Observation must be linked to a Person via MADE_BY" ;
+    ] .
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PhysicalDescription Shape
+# ═══════════════════════════════════════════════════════════════════════════════
+
+evt:PhysicalDescriptionShape a sh:NodeShape ;
+    sh:targetClass evt:PhysicalDescription ;
+    sh:property [
+        sh:path evt:summary ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:message "Every PhysicalDescription must have a summary" ;
+    ] .
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Provenance — every non-Observation node should have source attribution
+# ═══════════════════════════════════════════════════════════════════════════════
+
+evt:ProvenanceShape a sh:NodeShape ;
+    sh:targetClass evt:Event, evt:Person, evt:Vehicle, evt:Location,
+                   evt:Time, evt:Object, evt:PhysicalDescription ;
+    sh:property [
+        sh:path evt:source ;
+        sh:minCount 1 ;
+        sh:severity sh:Warning ;
+        sh:message "Node is missing source provenance — cannot trace to source text" ;
+    ] ;
+    sh:property [
+        sh:path evt:confidence ;
+        sh:minCount 1 ;
+        sh:severity sh:Info ;
+        sh:message "Node is missing confidence rating" ;
+    ] .

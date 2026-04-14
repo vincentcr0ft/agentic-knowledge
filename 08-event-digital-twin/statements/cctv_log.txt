@@ -1,0 +1,18 @@
+CCTV TRAFFIC CAMERA LOG — Junction of King Street / Queen's Road
+Camera ID: KS-QR-001
+Date: Tuesday 2026-04-07
+
+14:13:42 — Red vehicle (hatchback, partial plate KV68 ***) enters frame from King Street westbound, speed estimated 38 mph in 30 mph zone.
+14:13:44 — Cyclist visible crossing junction on Queen's Road northbound.
+14:13:45 — Impact: vehicle strikes cyclist at junction centre. Cyclist falls to road surface.
+14:13:48 — Vehicle stops approximately 12 metres past junction.
+14:14:02 — Vehicle driver door opens. Male figure exits (tall, dark jacket).
+14:14:18 — Driver returns to vehicle.
+14:14:22 — Vehicle departs northbound on Queen's Road.
+14:15:01 — Female pedestrian approaches cyclist from east pavement.
+14:15:08 — Female pedestrian appears to make phone call.
+14:15:44 — Second pedestrian (witness 1) approaches from King Street east.
+14:24:38 — Ambulance arrives from south on Queen's Road.
+14:25:12 — Paramedic team begins treatment of cyclist.
+
+Note: Footage reviewed by PC Williams, badge 4471. Original recording preserved as exhibit reference KS-QR-001-20260407.

@@ -8,6 +8,7 @@ Usage:
   python -m quality_probe --deepeval        Use DeepEval G-Eval metrics (Phase 2)
   python -m quality_probe --embeddings      Run PyKEEN embedding probes (Phase 3)
   python -m quality_probe --source FILE     Provide source text for faithfulness scoring
+  python -m quality_probe --calibrate       Run LLM probes 3x for score calibration
   python -m quality_probe --json            Output as JSON instead of human-readable
 
 Prerequisites:
@@ -19,14 +20,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import sys
 
 from neo4j import GraphDatabase
 
-from quality_probe.core import run_quality_probe
+from quality_core import run_quality_probe
 
 
 NEO4J_URI = "bolt://localhost:7687"
@@ -62,6 +61,14 @@ def main():
              "Requires: pip install pykeen",
     )
     parser.add_argument(
+        "--calibrate", action="store_true",
+        help="Run LLM probes multiple times and report mean +/- std",
+    )
+    parser.add_argument(
+        "--calibration-runs", type=int, default=3,
+        help="Number of calibration runs (default: 3)",
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="Output as JSON",
     )
@@ -88,6 +95,17 @@ def main():
             source_text = f.read().strip()
         print(f"  ✓ Loaded source text ({len(source_text)} chars)")
 
+    # Load SHACL shapes
+    shapes_ttl = None
+    if args.shacl:
+        shapes_path = os.path.join(os.path.dirname(__file__), "shapes.ttl")
+        if os.path.exists(shapes_path):
+            with open(shapes_path) as f:
+                shapes_ttl = f.read()
+            print(f"  ✓ Loaded SHACL shapes from shapes.ttl")
+        else:
+            print(f"  ⚠ shapes.ttl not found — SHACL validation will fail", file=sys.stderr)
+
     # Connect
     driver = GraphDatabase.driver(
         args.neo4j_uri,
@@ -107,18 +125,11 @@ def main():
         skip_llm=args.skip_llm,
         use_deepeval=args.deepeval,
         use_embeddings=args.embeddings,
+        use_shacl=args.shacl,
+        shapes_ttl=shapes_ttl,
+        calibrate=args.calibrate,
+        calibration_runs=args.calibration_runs,
     )
-
-    # Optionally run SHACL
-    if args.shacl:
-        from quality_probe.shacl_probes import probe_shacl_constraints
-        shacl_result = probe_shacl_constraints(driver)
-        report.constraint_score = shacl_result.score
-        report.violations.extend(shacl_result.violations)
-        report.dimension_results.append(shacl_result)
-        # Recompute overall
-        from quality_probe.core import _compute_overall
-        report.overall_score = _compute_overall(report)
 
     driver.close()
 
@@ -151,6 +162,11 @@ def main():
             ],
             "recommendations": report.recommendations,
         }
+        # Include calibration data if available
+        for dr in report.dimension_results:
+            cal = dr.details.get("calibration")
+            if cal:
+                output.setdefault("calibration", {})[dr.dimension] = cal
         print(json.dumps(output, indent=2))
     else:
         print(report.summary())

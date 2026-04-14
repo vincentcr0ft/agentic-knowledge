@@ -1,8 +1,7 @@
 """
 Quality Probe — Multi-dimensional knowledge graph quality assessment.
 
-Probes the quality of knowledge graphs produced by the event digital twin
-pipeline across multiple dimensions:
+Probes the quality of knowledge graphs across multiple dimensions:
 
   Phase 1 — Structural (Cypher-based, zero extra deps)
     1. Schema completeness  — are all expected node types populated?
@@ -22,4 +21,15 @@ pipeline across multiple dimensions:
    11. Entity clustering    — are entities well-separated with no hidden duplicates?
 """
 
-from quality_probe.core import QualityReport, Violation, run_quality_probe
+from quality_core import (
+    QualityReport,
+    Violation,
+    DimensionResult,
+    build_report,
+    run_quality_probe,
+    linearise_graph,
+    calibrate_llm_probe,
+    compute_overall,
+    generate_recommendations,
+    DIMENSION_WEIGHTS,
+)

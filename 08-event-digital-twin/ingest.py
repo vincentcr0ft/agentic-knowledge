@@ -56,6 +56,8 @@ llm = ChatOllama(model="qwen2.5:7b", temperature=0)
 
 class IngestState(TypedDict):
     raw_statement: str
+    source_id: str
+    source_type: str
     segments: list[str]
     extracted: dict
     resolved: dict
@@ -265,20 +267,28 @@ def _get_merge_key(label: str) -> str:
         "Vehicle": "description", "Location": "description",
         "Place": "description", "SpatialRegion": "description",
         "Time": "value", "TemporalRegion": "value",
-        "Object": "description", "Role": "description",
+        "TemporalInterval": "value",
+        "Object": "description",
+        "Role": "role_type", "AgentRole": "role_type",
         "PhysicalDescription": "summary",
+        "DescriptiveICE": "summary",
         "Observation": "description",
         "InformationContentEntity": "description",
+        "MaterialEntity": "description",
+        "Site": "description",
+        "Act": "description",
     }
     return merge_keys.get(label, "description")
 
 
 def load_to_graph(state: IngestState) -> dict:
-    """Load resolved entities and relationships into Neo4j."""
+    """Load resolved entities and relationships into Neo4j (additive)."""
     resolved = state["resolved"]
     entities = resolved.get("entities", [])
     relationships = resolved.get("relationships", [])
     timestamp = datetime.now(timezone.utc).isoformat()
+    source_id = state.get("source_id", "unknown")
+    source_type = state.get("source_type", "statement")
 
     # Get allowed labels/rels from active ontology
     allowed_labels = set(get_node_types().keys())
@@ -291,7 +301,12 @@ def load_to_graph(state: IngestState) -> dict:
     created_rels = 0
 
     with driver.session() as session:
-        session.run("MATCH (n) DETACH DELETE n")
+        # Record this ingestion as a GraphVersion node
+        session.run(
+            "CREATE (v:GraphVersion {source_id: $sid, source_type: $stype, "
+            "timestamp: $ts, ontology_id: $ont})",
+            sid=source_id, stype=source_type, ts=timestamp, ont=ontology_id,
+        )
 
         id_to_desc = {}
         for entity in entities:
@@ -313,10 +328,10 @@ def load_to_graph(state: IngestState) -> dict:
             )
             id_to_desc[entity_id] = desc_key
 
-            props["source"] = "original_statement"
-            props["source_type"] = "statement"
+            props["source"] = source_id
+            props["source_type"] = source_type
             props["extracted_at"] = timestamp
-            props["confidence"] = "high"
+            props["confidence"] = 0.8
             props["ontology_id"] = ontology_id
 
             safe_props = {
@@ -372,9 +387,9 @@ def load_to_graph(state: IngestState) -> dict:
 
     prov_msg = materialise_provenance(
         driver,
-        source_type="statement",
-        observation_desc="Original witness statement",
-        observation_type="witness_statement",
+        source_type=source_type,
+        observation_desc=f"Source: {source_id}",
+        observation_type=source_type,
     )
 
     graph_view = linearise_graph(driver)
@@ -409,10 +424,30 @@ def build_ingest_graph() -> StateGraph:
     return builder.compile()
 
 
-def ingest_statement(text: str) -> IngestState:
+def ingest_statement(
+    text: str,
+    source_id: str = "statement_1",
+    source_type: str = "statement",
+    clear: bool = False,
+) -> IngestState:
+    """Ingest a statement into the graph.
+
+    Args:
+        text: The statement text.
+        source_id: Unique identifier for this source.
+        source_type: Type of source (statement, cctv, forensic, etc.).
+        clear: If True, wipe the graph before ingesting.
+    """
+    if clear:
+        with driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+            print("  ✓ Graph cleared")
+
     graph = build_ingest_graph()
     initial_state: IngestState = {
         "raw_statement": text,
+        "source_id": source_id,
+        "source_type": source_type,
         "segments": [],
         "extracted": {},
         "resolved": {},

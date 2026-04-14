@@ -93,14 +93,24 @@ def load_statement(file_path: str | None) -> str:
 # Phase 1 — Ingest
 # ═══════════════════════════════════════════════════════════════════════════
 
-def phase_ingest(statement: str):
+def phase_ingest(
+    statement: str,
+    source_id: str = "statement_1",
+    source_type: str = "statement",
+    clear: bool = False,
+):
     spec = get_active_spec()
     print(f"\n{'═' * 70}")
     print(f"  PHASE 1: INGEST  (ontology: {spec.name})")
-    print(f"  Witness statement → Knowledge graph")
+    print(f"  Source: {source_id} ({source_type})")
     print(f"{'═' * 70}\n")
 
-    result = ingest_statement(statement)
+    result = ingest_statement(
+        statement,
+        source_id=source_id,
+        source_type=source_type,
+        clear=clear,
+    )
 
     triples = linearise_graph(driver)
     triple_count = triples.count("\n") + 1 if triples != "(empty graph)" else 0
@@ -229,6 +239,80 @@ def phase_query():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Phase 1b — Multi-source Fusion
+# ═══════════════════════════════════════════════════════════════════════════
+
+def phase_fuse():
+    """Cross-source entity resolution and corroboration detection."""
+    print(f"\n{'═' * 70}")
+    print(f"  PHASE 1b: MULTI-SOURCE FUSION")
+    print(f"  Cross-source entity resolution → corroboration → contradictions")
+    print(f"{'═' * 70}\n")
+
+    from fusion import run_fusion
+    report = run_fusion(driver)
+
+    print(f"\n  Fusion complete:")
+    print(f"    Merges:         {report.get('merges', 0)}")
+    print(f"    Corroborations: {report.get('corroborations', 0)}")
+    print(f"    Contradictions: {report.get('contradictions', 0)}")
+    print(f"{'─' * 70}\n")
+    return report
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 2a — Temporal Reasoning
+# ═══════════════════════════════════════════════════════════════════════════
+
+def phase_temporal():
+    """Build event timeline and check temporal consistency."""
+    print(f"\n{'═' * 70}")
+    print(f"  PHASE 2a: TEMPORAL REASONING")
+    print(f"  Timeline construction → consistency checking")
+    print(f"{'═' * 70}\n")
+
+    from temporal import build_timeline, check_consistency
+    timeline = build_timeline(driver)
+    issues = check_consistency(driver)
+
+    print(f"  Timeline: {len(timeline)} ordered events")
+    for i, evt in enumerate(timeline[:10], 1):
+        time_str = evt.get("time", "?")
+        desc = evt.get("description", "?")[:60]
+        print(f"    {i}. [{time_str}] {desc}")
+    if len(timeline) > 10:
+        print(f"    … and {len(timeline) - 10} more")
+
+    if issues:
+        print(f"\n  Temporal issues: {len(issues)}")
+        for issue in issues[:5]:
+            print(f"    ⚠ {issue}")
+    else:
+        print(f"\n  ✓ No temporal inconsistencies detected")
+
+    print(f"{'─' * 70}\n")
+    return timeline
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Source type inference
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _infer_source_type(stem: str) -> str:
+    """Infer source type from filename stem."""
+    stem_lower = stem.lower()
+    if "cctv" in stem_lower or "camera" in stem_lower:
+        return "cctv"
+    elif "forensic" in stem_lower or "report" in stem_lower:
+        return "forensic_report"
+    elif "paramedic" in stem_lower or "medical" in stem_lower:
+        return "medical_report"
+    elif "police" in stem_lower or "officer" in stem_lower:
+        return "police_report"
+    return "statement"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Hallucination Assessment (stub — to be implemented)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -276,14 +360,15 @@ def assess_hallucination(source_text: str):
 # ═══════════════════════════════════════════════════════════════════════════
 
 USAGE = """\
-Usage: python demo.py [statement_file] [options]
+Usage: python demo.py [statement_files...] [options]
 
 Arguments:
-  statement_file        Path to a .txt file with the witness statement
+  statement_files       One or more .txt files (multi-source fusion)
 
 Options:
   --ontology ID         Select ontology (default: schema-org-event-v1)
                         Available: """ + ", ".join(ONTOLOGY_REGISTRY.keys()) + """
+  --clear               Wipe the graph before ingesting
   --skip-interview      Skip Phase 2 (interview)
   --interview           Run only interview (graph must exist)
   --query               Run only query (graph must exist)
@@ -299,7 +384,7 @@ Options:
 def _parse_args():
     args = sys.argv[1:]
     flags = set()
-    file_path = None
+    file_paths = []
     transcript_path = "transcript.txt"
     ontology_id = None
 
@@ -317,14 +402,15 @@ def _parse_args():
         elif arg.startswith("--"):
             flags.add(arg)
         else:
-            file_path = arg
+            file_paths.append(arg)
         i += 1
 
-    return file_path, flags, transcript_path, ontology_id
+    return file_paths, flags, transcript_path, ontology_id
 
 
 def main():
-    file_path, flags, transcript_path, ontology_id = _parse_args()
+    file_paths, flags, transcript_path, ontology_id = _parse_args()
+    file_path = file_paths[0] if file_paths else None
 
     if "--help" in flags or "-h" in flags:
         print(USAGE)
@@ -339,8 +425,8 @@ def main():
         return
 
     print("=" * 70)
-    print("  Module 08: Digital Twin")
-    print("  Statement → KG → Self-Resolution → Quality → Grounded Q&A")
+    print("  Module 08: Event Digital Twin")
+    print("  Multi-source → KG → Fusion → Quality → Grounded Q&A")
     print("=" * 70)
 
     # Select ontology
@@ -370,30 +456,64 @@ def main():
         phase_query()
 
     else:
-        statement = load_statement(file_path)
+        # ── Multi-source ingestion ────────────────────────────────────
+        clear = "--clear" in flags
+        sources = []
 
-        # Phase 1: Ingest
-        phase_ingest(statement)
+        if file_paths:
+            for fp in file_paths:
+                p = Path(fp)
+                if not p.exists():
+                    print(f"  ✗ File not found: {fp}")
+                    sys.exit(1)
+                text = p.read_text().strip()
+                # Derive source_id and type from filename
+                stem = p.stem.replace(" ", "_")
+                stype = _infer_source_type(stem)
+                sources.append((text, stem, stype))
+        else:
+            text = load_statement(None)
+            sources.append((text, "interactive_statement", "statement"))
 
-        # Phase 2: Interview (optional)
+        # Phase 1: Ingest each source (additive)
+        all_source_texts = []
+        for i, (text, sid, stype) in enumerate(sources):
+            phase_ingest(
+                text,
+                source_id=sid,
+                source_type=stype,
+                clear=(clear and i == 0),  # only clear on first
+            )
+            all_source_texts.append(text)
+
+        # Phase 1b: Multi-source fusion (if > 1 source)
+        if len(sources) > 1:
+            phase_fuse()
+
+        # Phase 2: Temporal analysis
+        phase_temporal()
+
+        # Phase 3: Interview (optional)
+        combined_text = "\n\n---\n\n".join(all_source_texts)
         if "--skip-interview" not in flags:
-            phase_interview(statement=statement, transcript_path=transcript_path)
+            phase_interview(statement=combined_text, transcript_path=transcript_path)
 
-        # Phase 3: Quality
-        phase_quality(source_text=statement, skip_llm=("--skip-llm" in flags))
+        # Phase 4: Quality
+        phase_quality(source_text=combined_text, skip_llm=("--skip-llm" in flags))
 
-        # Phase 4: Query
+        # Phase 5: Query
         phase_query()
 
     print(f"\n{'=' * 70}")
     print("  Key concepts demonstrated:")
     print(f"  • Pluggable ontology ({get_active_spec().name})")
-    print("  • Schema-guided extraction with qwen2.5:7b")
-    print("  • Self-resolution + human-in-the-loop interview")
+    print("  • Multi-source additive ingestion")
+    print("  • Cross-source entity resolution & corroboration")
+    print("  • Temporal reasoning & timeline construction")
     print("  • Multi-dimensional quality assessment")
     print("  • Provenance tracking (SOSA/PROV-O)")
     print("  • Grounded Q&A with [FACT: ...] citations")
-    print("  • Hallucination rate assessment (--hallucination-check)")
+    print("  • Confidence scoring with Bayesian updates")
     print("=" * 70)
 
     driver.close()

@@ -336,7 +336,40 @@ def run_interactive():
     triples = linearise_graph(driver)
     triple_count = triples.count("\n") + 1 if triples != "(empty graph)" else 0
     print(f"\n  Graph contains {triple_count} triples.")
-    print(f"  Ask anything about the event. Type 'quit' to exit.\n")
+
+    # Show source summary
+    with driver.session() as sess:
+        src_result = sess.run(
+            "MATCH (n) WHERE n.source IS NOT NULL AND NOT n:GraphVersion "
+            "RETURN DISTINCT n.source AS src, count(n) AS cnt "
+            "ORDER BY cnt DESC"
+        )
+        sources_info = [(r["src"], r["cnt"]) for r in src_result]
+    if sources_info:
+        print(f"  Sources ingested: {len(sources_info)}")
+        for src, cnt in sources_info:
+            print(f"    • {src}: {cnt} nodes")
+
+    # Show fusion summary
+    with driver.session() as sess:
+        contra = sess.run("MATCH ()-[r:CONTRADICTS]->() RETURN count(r) AS c").single()
+        corrob = sess.run("MATCH ()-[r:CORROBORATED_BY]->() RETURN count(r) AS c").single()
+        same = sess.run("MATCH ()-[r:POSSIBLY_SAME_AS]->() RETURN count(r) AS c").single()
+    c_contra = contra["c"] if contra else 0
+    c_corrob = corrob["c"] if corrob else 0
+    c_same = same["c"] if same else 0
+    if c_contra + c_corrob + c_same > 0:
+        print(f"  Fusion: {c_same} entity matches, {c_corrob} corroborations, {c_contra} contradictions")
+
+    print(f"\n  Commands:")
+    print(f"    /sources           — list all sources")
+    print(f"    /from <source_id>  — filter to one source")
+    print(f"    /contradictions    — show all contradictions")
+    print(f"    /timeline          — show event timeline")
+    print(f"    /export <format>   — export graph (dot/html/turtle/jsonld)")
+    print(f"    /whatif remove <source_id>  — simulate removing a source")
+    print(f"    quit               — exit")
+    print(f"\n  Or ask any question about the event.\n")
 
     query_num = 0
     while True:
@@ -347,6 +380,11 @@ def run_interactive():
 
         if not question or question.lower() in ("quit", "exit", "q", "done"):
             break
+
+        # Handle special commands
+        if question.startswith("/"):
+            _handle_command(question, driver)
+            continue
 
         query_num += 1
         config = {"configurable": {"thread_id": f"interactive-{query_num}"}}
@@ -373,6 +411,109 @@ def run_interactive():
                     sources.add(f"{src} ({conf})" if conf else src)
             if sources:
                 print(f"\n  Sources: {', '.join(sorted(sources))}")
+        print()
+
+
+def _handle_command(cmd: str, driver):
+    """Handle / commands in the interactive query session."""
+    parts = cmd.strip().split()
+    action = parts[0].lower()
+
+    if action == "/sources":
+        with driver.session() as sess:
+            result = sess.run(
+                "MATCH (n) WHERE n.source IS NOT NULL AND NOT n:GraphVersion "
+                "RETURN DISTINCT n.source AS src, n.source_type AS stype, "
+                "count(n) AS cnt ORDER BY cnt DESC"
+            )
+            print()
+            for rec in result:
+                print(f"    {rec['src']:30s} ({rec['stype'] or '?':15s}) — {rec['cnt']} nodes")
+            print()
+
+    elif action == "/from" and len(parts) >= 2:
+        source_id = parts[1]
+        with driver.session() as sess:
+            result = sess.run(
+                "MATCH (n) WHERE n.source = $sid AND NOT n:GraphVersion "
+                "OPTIONAL MATCH (n)-[r]->(m) "
+                "RETURN labels(n)[0] AS label, "
+                "coalesce(n.description, n.name_or_description, n.name, "
+                "n.value, n.summary) AS desc, "
+                "type(r) AS rel, "
+                "coalesce(m.description, m.name_or_description, m.name, "
+                "m.value, m.summary) AS target",
+                sid=source_id,
+            )
+            print(f"\n  Facts from '{source_id}':")
+            for rec in result:
+                line = f"    ({rec['label']}: {rec['desc']})"
+                if rec["rel"]:
+                    line += f" -[{rec['rel']}]-> ({rec['target']})"
+                print(line)
+            print()
+
+    elif action == "/contradictions":
+        with driver.session() as sess:
+            result = sess.run(
+                "MATCH (a)-[r:CONTRADICTS]->(b) "
+                "RETURN coalesce(a.description, a.value) AS entity_a, "
+                "a.source AS src_a, "
+                "coalesce(b.description, b.value) AS entity_b, "
+                "b.source AS src_b, "
+                "r.field AS field, r.value_a AS val_a, r.value_b AS val_b"
+            )
+            print(f"\n  Contradictions:")
+            count = 0
+            for rec in result:
+                count += 1
+                print(f"    {count}. [{rec.get('field', '?')}] "
+                      f"'{rec['entity_a']}' ({rec.get('src_a', '?')}) = {rec.get('val_a', '?')}  vs  "
+                      f"'{rec['entity_b']}' ({rec.get('src_b', '?')}) = {rec.get('val_b', '?')}")
+            if count == 0:
+                print("    (none)")
+            print()
+
+    elif action == "/timeline":
+        from temporal import build_timeline, format_timeline_ascii
+        timeline = build_timeline(driver)
+        print(format_timeline_ascii(timeline))
+
+    elif action == "/export" and len(parts) >= 2:
+        fmt = parts[1].lower()
+        from export import export_dot, export_html, export_turtle, export_jsonld
+        if fmt == "dot":
+            export_dot(driver, "event_graph.dot")
+        elif fmt == "html":
+            export_html(driver, "event_graph.html")
+        elif fmt == "turtle":
+            export_turtle(driver, "event_graph.ttl")
+        elif fmt == "jsonld":
+            export_jsonld(driver, "event_graph.jsonld")
+        else:
+            print(f"    Unknown format: {fmt}. Use: dot, html, turtle, jsonld")
+
+    elif action == "/whatif" and len(parts) >= 3:
+        op = parts[1].lower()
+        if op == "remove" and len(parts) >= 3:
+            source_id = parts[2]
+            from simulation import run_what_if
+            result = run_what_if(driver, f"remove_{source_id}", "remove_source",
+                                 source_id=source_id)
+            comp = result.get("comparison", {})
+            print(f"\n  What-if: remove '{source_id}'")
+            print(f"    Nodes removed: {comp.get('only_in_a', 0)}")
+            print(f"    Remaining nodes: {result.get('after_nodes', 0)}")
+            details = comp.get("details", {})
+            for n in details.get("nodes_only_a", [])[:5]:
+                print(f"      - ({n['labels']}) {n['desc']}")
+            print(f"    (baseline restored)\n")
+        else:
+            print(f"    Usage: /whatif remove <source_id>")
+
+    else:
+        print(f"    Unknown command: {cmd}")
+        print(f"    Try: /sources, /from <id>, /contradictions, /timeline, /export <fmt>, /whatif remove <id>")
         print()
 
 

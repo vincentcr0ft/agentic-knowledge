@@ -16,23 +16,15 @@ Metrics:
 
 from __future__ import annotations
 
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from quality_probe.core import DimensionResult, Violation
-from schema import linearise_graph
+from quality_core import DimensionResult, Violation
 
 
 def _deepeval_available() -> bool:
-    """Check if DeepEval is installed and compatible with this Python version."""
+    """Check if DeepEval is installed."""
     try:
         import deepeval  # noqa: F401
         return True
     except Exception:
-        # ImportError if not installed; TypeError on Python <3.10
-        # (deepeval uses X | None union syntax requiring 3.10+)
         return False
 
 
@@ -71,15 +63,18 @@ def _get_ollama_model():
 # 1. Narrative Coherence (G-Eval)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def probe_coherence_deepeval(driver) -> DimensionResult:
+def probe_coherence_deepeval(triples: str) -> DimensionResult:
     """Score narrative coherence using DeepEval G-Eval.
 
-    Falls back to the native LLM probe if DeepEval is not installed.
+    Args:
+        triples: Linearised graph triples (from linearise_graph()).
+
+    Falls back to score -1.0 sentinel if DeepEval is not installed.
     """
     if not _deepeval_available():
         return DimensionResult(
             dimension="coherence",
-            score=-1.0,  # sentinel: caller should fall back
+            score=-1.0,
             violations=[Violation(
                 dimension="coherence",
                 severity="info",
@@ -91,7 +86,6 @@ def probe_coherence_deepeval(driver) -> DimensionResult:
     from deepeval.metrics import GEval
     from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
-    triples = linearise_graph(driver)
     if triples == "(empty graph)":
         return DimensionResult(
             dimension="coherence",
@@ -166,13 +160,12 @@ def probe_coherence_deepeval(driver) -> DimensionResult:
 # 2. Extraction Faithfulness (G-Eval)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def probe_faithfulness_deepeval(driver, source_text: str) -> DimensionResult:
+def probe_faithfulness_deepeval(triples: str, source_text: str) -> DimensionResult:
     """Score extraction faithfulness using DeepEval G-Eval.
 
-    Checks whether the extracted graph is faithful to the source text,
-    without hallucinated facts.
-
-    Falls back to the native LLM probe if DeepEval is not installed.
+    Args:
+        triples:     Linearised graph triples.
+        source_text: Original source document text.
     """
     if not _deepeval_available():
         return DimensionResult(
@@ -189,7 +182,6 @@ def probe_faithfulness_deepeval(driver, source_text: str) -> DimensionResult:
     from deepeval.metrics import GEval
     from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
-    triples = linearise_graph(driver)
     if triples == "(empty graph)":
         return DimensionResult(
             dimension="faithfulness",
@@ -266,12 +258,12 @@ def probe_faithfulness_deepeval(driver, source_text: str) -> DimensionResult:
 # 3. Semantic Completeness (G-Eval)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def probe_semantic_completeness(driver, source_text: str) -> DimensionResult:
+def probe_semantic_completeness(triples: str, source_text: str) -> DimensionResult:
     """Score whether the graph captures all important facts from the source.
 
-    Complements schema completeness (which checks node-type population)
-    with a semantic check: are there important facts in the source text
-    that the graph fails to represent?
+    Args:
+        triples:     Linearised graph triples.
+        source_text: Original source document text.
     """
     if not _deepeval_available():
         return DimensionResult(
@@ -288,7 +280,6 @@ def probe_semantic_completeness(driver, source_text: str) -> DimensionResult:
     from deepeval.metrics import GEval
     from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
-    triples = linearise_graph(driver)
     if triples == "(empty graph)":
         return DimensionResult(
             dimension="semantic_completeness",
@@ -366,11 +357,11 @@ def probe_semantic_completeness(driver, source_text: str) -> DimensionResult:
 # 4. Investigative Readiness (G-Eval)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def probe_investigative_readiness(driver) -> DimensionResult:
+def probe_investigative_readiness(triples: str) -> DimensionResult:
     """Score whether the graph is useful for investigative purposes.
 
-    Evaluates from a police investigator's perspective: would this graph
-    help reconstruct what happened and identify next steps?
+    Args:
+        triples: Linearised graph triples.
     """
     if not _deepeval_available():
         return DimensionResult(
@@ -387,7 +378,6 @@ def probe_investigative_readiness(driver) -> DimensionResult:
     from deepeval.metrics import GEval
     from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
-    triples = linearise_graph(driver)
     if triples == "(empty graph)":
         return DimensionResult(
             dimension="investigative_readiness",

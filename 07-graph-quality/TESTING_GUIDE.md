@@ -123,6 +123,15 @@ python -m quality_probe --deepeval --embeddings --source transcript.txt --json 2
 Outputs a structured JSON report. Redirect stderr (`2>/dev/null`) to suppress
 Neo4j deprecation warnings.
 
+### With LLM score calibration
+
+```bash
+python -m quality_probe --calibrate --source transcript.txt
+```
+
+Runs each LLM probe 3 times and reports the median score plus mean ± std.
+This addresses the fundamental non-determinism of LLM-as-judge scoring.
+
 ### CLI Flag Summary
 
 | Flag | Effect |
@@ -130,7 +139,9 @@ Neo4j deprecation warnings.
 | `--skip-llm` | Skip all LLM-based probes (fast structural-only check) |
 | `--shacl` | Include SHACL shape validation |
 | `--deepeval` | Use DeepEval G-Eval for LLM metrics (falls back to native if unavailable) |
-| `--embeddings` | Run PyKEEN KG embedding probes |
+| `--embeddings` | Run PyKEEN KG embedding probes (RotatE model) |
+| `--calibrate` | Run LLM probes multiple times for score calibration |
+| `--calibration-runs N` | Number of calibration runs (default: 3) |
 | `--source FILE` | Provide source text file for faithfulness/completeness scoring |
 | `--json` | Machine-readable JSON output |
 | `--neo4j-uri` | Neo4j connection URI (default: `bolt://localhost:7687`) |
@@ -445,7 +456,7 @@ assesses the graph on its own merits:
 
 ## Phase 3 — Embedding Probes (PyKEEN)
 
-These probes train a knowledge graph embedding model (ComplEx) on the graph
+These probes train a knowledge graph embedding model (RotatE) on the graph
 and use the learned vector representations to detect structural anomalies.
 They are most valuable for larger graphs (50+ triples) and multi-statement
 fusion scenarios.
@@ -455,17 +466,17 @@ fusion scenarios.
 ### How the embedding model works
 
 The system exports all Neo4j relationships as (subject, predicate, object)
-triples and trains a **ComplEx** model:
+triples and trains a **RotatE** model (Sun et al., ICLR 2019):
 
 - **Embedding dimension:** 50
 - **Training epochs:** 100
 - **Batch size:** min(64, number_of_triples)
 - **Random seed:** 42 (reproducible results)
 
-ComplEx learns vector representations for every entity and relationship such
-that valid triples score higher than invalid ones. After training, the model
-can predict missing links, score existing triples, and compare entity
-similarity.
+RotatE models each relation as a rotation in complex space, which handles
+asymmetric relations (PRECEDED, WITNESSED) better than earlier models like
+ComplEx. After training, the model can predict missing links, score existing
+triples, and compare entity similarity.
 
 ---
 

@@ -17,18 +17,61 @@ from pathlib import Path
 # Add the ontology module to the path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "06-ontologies"))
 
-from ontology_spec import (      # noqa: E402
-    OntologySpec,
-    NodeDef,
-    RelDef,
-    ONTOLOGY_REGISTRY,
-    build_extraction_prompt,
-    build_shacl_shapes,
-    linearise_for_spec,
-    init_database_for_spec,
-)
+from ontology_spec import OntologySpec, NodeSpec, RelSpec  # noqa: E402
+from schema_org_event import SCHEMA_ORG_EVENT  # noqa: E402
+from sem_event import SEM_EVENT  # noqa: E402
+from bfo_cco_event import BFO_CCO_EVENT  # noqa: E402
 
 from neo4j import GraphDatabase  # noqa: E402
+
+# ── Compatibility aliases & registry ────────────────────────────────────
+NodeDef = NodeSpec
+RelDef = RelSpec
+
+ONTOLOGY_REGISTRY: dict[str, OntologySpec] = {
+    spec.id: spec for spec in [SCHEMA_ORG_EVENT, SEM_EVENT, BFO_CCO_EVENT]
+}
+
+
+def build_extraction_prompt(spec: OntologySpec) -> str:
+    """Standalone wrapper around spec.build_extraction_prompt()."""
+    return spec.build_extraction_prompt()
+
+
+def build_shacl_shapes(spec: OntologySpec) -> str:
+    """Standalone wrapper around spec.build_shacl_shapes()."""
+    return spec.build_shacl_shapes()
+
+
+def linearise_for_spec(driver, spec: OntologySpec) -> str:
+    """Linearise graph nodes/rels into human-readable triples."""
+    lines = []
+    with driver.session() as session:
+        result = session.run(
+            "MATCH (a)-[r]->(b) "
+            "RETURN labels(a)[0] AS a_label, "
+            "  coalesce(a.description, a.name_or_description, a.value, "
+            "    a.summary, toString(id(a))) AS a_desc, "
+            "  type(r) AS rel, "
+            "  labels(b)[0] AS b_label, "
+            "  coalesce(b.description, b.name_or_description, b.value, "
+            "    b.summary, toString(id(b))) AS b_desc"
+        )
+        for rec in result:
+            lines.append(
+                f"({rec['a_label']}: {rec['a_desc']}) "
+                f"-[{rec['rel']}]-> "
+                f"({rec['b_label']}: {rec['b_desc']})"
+            )
+    return "\n".join(lines) if lines else "(empty graph)"
+
+
+def init_database_for_spec(driver, spec: OntologySpec) -> None:
+    """Create uniqueness constraints from the ontology spec."""
+    stmts = spec.get_constraint_cypher()
+    with driver.session() as session:
+        for stmt in stmts:
+            session.run(stmt)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Default ontology — can be overridden via select_ontology()

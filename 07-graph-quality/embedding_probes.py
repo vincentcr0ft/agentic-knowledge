@@ -3,10 +3,14 @@ Phase 3 — Knowledge graph embedding probes via PyKEEN.
 
 Requires: pip install pykeen
 
-Uses KG embeddings (ComplEx) to:
+Uses KG embeddings (RotatE by default) to:
   1. Predict missing links — surface potential gaps in the graph
   2. Score triple plausibility — flag low-confidence triples
   3. Cluster entities — detect misplaced or incorrectly linked nodes
+
+RotatE (Sun et al., ICLR 2019) is the default model — it handles
+asymmetric relations (PRECEDED, WITNESSED) better than ComplEx via
+rotation in complex space.  ComplEx is available as a fallback.
 
 This is most valuable for larger graphs (50+ triples), especially
 in the multi-statement fusion scenario where multiple witness
@@ -15,16 +19,15 @@ accounts are combined.
 
 from __future__ import annotations
 
-import os
-import sys
+from quality_core import DimensionResult, Violation
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from quality_probe.core import DimensionResult, Violation
+# Default embedding model — RotatE handles asymmetric relations well
+DEFAULT_MODEL = "RotatE"
+DEFAULT_DIM = 50
+DEFAULT_EPOCHS = 100
 
 
 def _pykeen_available() -> bool:
-    """Check if PyKEEN is installed."""
     try:
         import pykeen  # noqa: F401
         return True
@@ -33,11 +36,7 @@ def _pykeen_available() -> bool:
 
 
 def _export_triples(driver) -> list[list[str]]:
-    """Export Neo4j relationships as [subject, predicate, object] triples
-    suitable for PyKEEN.
-
-    Entities are encoded as 'Label:description' strings.
-    """
+    """Export Neo4j relationships as [subject, predicate, object] triples."""
     triples = []
     with driver.session() as session:
         result = session.run(
@@ -55,8 +54,8 @@ def _export_triples(driver) -> list[list[str]]:
     return triples
 
 
-def _train_model(triples: list[list[str]]):
-    """Train a ComplEx model on the given triples via PyKEEN.
+def _train_model(triples: list[list[str]], model_name: str = DEFAULT_MODEL):
+    """Train a KG embedding model via PyKEEN.
 
     Returns (model, triples_factory).
     """
@@ -69,11 +68,11 @@ def _train_model(triples: list[list[str]]):
 
     result = pipeline(
         training=tf,
-        testing=tf,  # use training as test set (we score known triples)
-        model="ComplEx",
-        model_kwargs=dict(embedding_dim=50),
+        testing=tf,
+        model=model_name,
+        model_kwargs=dict(embedding_dim=DEFAULT_DIM),
         training_kwargs=dict(
-            num_epochs=100,
+            num_epochs=DEFAULT_EPOCHS,
             batch_size=min(64, len(triples)),
         ),
         random_seed=42,
@@ -83,18 +82,11 @@ def _train_model(triples: list[list[str]]):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 1. Link Prediction — discover missing relationships
+# 1. Link Prediction
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def probe_link_prediction(driver, top_k: int = 10) -> DimensionResult:
-    """Train a KG embedding model and predict missing links.
-
-    Missing links suggest gaps: relationships that the graph structure
-    implies should exist but don't.
-
-    Returns predictions as info-level violations (they're suggestions,
-    not errors).
-    """
+    """Train a KG embedding model and predict missing links."""
     if not _pykeen_available():
         return DimensionResult(
             dimension="link_prediction",
@@ -123,7 +115,7 @@ def probe_link_prediction(driver, top_k: int = 10) -> DimensionResult:
                 severity="info",
                 message=(
                     f"Graph has only {len(triples)} triples — too small for "
-                    f"meaningful link prediction (need ≥ 10)"
+                    f"meaningful link prediction (need >= 10)"
                 ),
             )],
             details={"triple_count": len(triples), "skipped": True},
@@ -138,7 +130,6 @@ def probe_link_prediction(driver, top_k: int = 10) -> DimensionResult:
         existing = set(tuple(t) for t in triples)
         predictions = []
 
-        # For a sample of (head, relation) pairs, predict the best tails
         sample_size = min(20, len(triples))
         rng = np.random.RandomState(42)
         sample_idx = rng.choice(len(triples), size=sample_size, replace=False)
@@ -155,7 +146,6 @@ def probe_link_prediction(driver, top_k: int = 10) -> DimensionResult:
             r_id = relation_ids[r_label]
 
             with torch.no_grad():
-                # Build (h, r) repeated for every possible tail
                 n_ent = tf.num_entities
                 hr = torch.tensor([[h_id, r_id]], dtype=torch.long).repeat(n_ent, 1)
                 t_ids = torch.arange(n_ent, dtype=torch.long).unsqueeze(1)
@@ -198,7 +188,7 @@ def probe_link_prediction(driver, top_k: int = 10) -> DimensionResult:
                 "entity_count": tf.num_entities,
                 "relation_count": tf.num_relations,
                 "predicted_missing": len(predictions),
-                "model": "ComplEx",
+                "model": DEFAULT_MODEL,
             },
         )
 
@@ -216,14 +206,11 @@ def probe_link_prediction(driver, top_k: int = 10) -> DimensionResult:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. Triple Plausibility — score existing triples
+# 2. Triple Plausibility
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def probe_triple_plausibility(driver, threshold: float = 0.3) -> DimensionResult:
-    """Score the plausibility of each existing triple using KG embeddings.
-
-    Low-scoring triples may be extraction errors or hallucinations.
-    """
+    """Score the plausibility of each existing triple using KG embeddings."""
     if not _pykeen_available():
         return DimensionResult(
             dimension="triple_plausibility",
@@ -258,12 +245,10 @@ def probe_triple_plausibility(driver, threshold: float = 0.3) -> DimensionResult
         model, tf = _train_model(triples)
         model.eval()
 
-        # Score each existing triple
         mapped = tf.mapped_triples
         with torch.no_grad():
             scores = model.score_hrt(mapped)
 
-        # Normalise with sigmoid
         normalised = torch.sigmoid(scores).squeeze().numpy()
 
         violations = []
@@ -293,7 +278,7 @@ def probe_triple_plausibility(driver, threshold: float = 0.3) -> DimensionResult
                 "mean_score": float(np.mean(normalised)),
                 "min_score": float(np.min(normalised)),
                 "threshold": threshold,
-                "model": "ComplEx",
+                "model": DEFAULT_MODEL,
             },
         )
 
@@ -311,16 +296,11 @@ def probe_triple_plausibility(driver, threshold: float = 0.3) -> DimensionResult
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. Entity Clustering — detect misplaced entities
+# 3. Entity Clustering
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def probe_entity_clusters(driver) -> DimensionResult:
-    """Use KG embeddings to cluster entities and detect outliers.
-
-    Entities that cluster far from their expected group may be
-    incorrectly linked or represent entity resolution failures
-    (e.g., the same person extracted as two different nodes).
-    """
+    """Use KG embeddings to cluster entities and detect outliers."""
     if not _pykeen_available():
         return DimensionResult(
             dimension="entity_clustering",
@@ -355,19 +335,17 @@ def probe_entity_clusters(driver) -> DimensionResult:
         model, tf = _train_model(triples)
         model.eval()
 
-        # Get entity embeddings from PyKEEN
         entity_repr = model.entity_representations[0]
         with torch.no_grad():
             embeddings_t = entity_repr()
         embeddings = embeddings_t.detach().numpy()
 
-        # Use real part only for ComplEx (embeddings are complex)
         if np.iscomplexobj(embeddings):
             embeddings = embeddings.real
 
         entities = [tf.entity_id_to_label[i] for i in range(tf.num_entities)]
 
-        # Group entities by their Neo4j label (prefix before ':')
+        # Group entities by their Neo4j label
         label_groups: dict[str, list[int]] = {}
         for i, ent in enumerate(entities):
             label = ent.split(":")[0] if ":" in ent else "Unknown"
@@ -375,7 +353,7 @@ def probe_entity_clusters(driver) -> DimensionResult:
 
         violations = []
 
-        # For each group, compute centroid and flag outliers (> 2 std from centroid)
+        # Outlier detection per group
         for label, indices in label_groups.items():
             if len(indices) < 2:
                 continue
@@ -403,12 +381,10 @@ def probe_entity_clusters(driver) -> DimensionResult:
                         node_label=label,
                     ))
 
-        # Also check for potential duplicates: entities of the same label
-        # whose embeddings are very close
+        # Near-duplicate detection
         for label, indices in label_groups.items():
             if len(indices) < 2:
                 continue
-
             group_embeddings = embeddings[indices]
             for i in range(len(indices)):
                 for j in range(i + 1, len(indices)):
@@ -437,7 +413,7 @@ def probe_entity_clusters(driver) -> DimensionResult:
                 "label_groups": {k: len(v) for k, v in label_groups.items()},
                 "outlier_count": outlier_count,
                 "duplicate_candidates": sum(1 for v in violations if v.severity == "info"),
-                "model": "ComplEx",
+                "model": DEFAULT_MODEL,
             },
         )
 

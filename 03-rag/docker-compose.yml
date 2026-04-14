@@ -4,7 +4,8 @@ services:
     ports:
       - "11434:11434"
     volumes:
-      - ollama_data:/root/.ollama
+      - ~/.ollama:/root/.ollama
+      - ../combined-ca-certs.pem:/etc/ssl/certs/ca-certificates.crt:ro
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/11434'"]
       interval: 10s
@@ -16,10 +17,9 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
-    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-qwen2.5:7b}"]
+    entrypoint: ["ollama", "list"]
     environment:
       - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ../combined-ca-certs.pem:/etc/ssl/certs/ca-certificates.crt:ro
     restart: "no"
-
-volumes:
-  ollama_data:

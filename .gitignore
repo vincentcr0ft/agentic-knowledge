@@ -13,6 +13,9 @@ build/
 *.sqlite
 *.db
 
+# Corporate CA certs (environment-specific)
+*.pem
+
 # OS
 .DS_Store
 Thumbs.db
